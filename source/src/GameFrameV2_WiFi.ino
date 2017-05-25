@@ -1,6 +1,6 @@
 /***************************************************
   Game Frame V3 Source Code
-  Jeremy Williams, 12-11-2016
+  Jeremy Williams, 5-23-2017
 
   NOTE: Altering your firmware voids your warranty. Have fun.
 
@@ -10,7 +10,7 @@
 
   In the SD card, place 24 bit color BMP files
 ****************************************************/
-#define firmwareVersion 20161211 // firmware version
+#define firmwareVersion 20170523 // firmware version
 
 #pragma SPARK_NO_PREPROCESSOR
 #include "SdFat.h"
@@ -25,8 +25,11 @@ FASTLED_USING_NAMESPACE;
 #include "WebServerPM.h"
 #include <math.h>
 #include "effects.h"
+#include "colorNameToRGB.h"
 
+SYSTEM_THREAD(ENABLED);
 SYSTEM_MODE(SEMI_AUTOMATIC);
+//SerialLogHandler logHandler(LOG_LEVEL_ALL); // get WIFI debug prints
 
 // function prototypes required by disabling the spark preprocessor
 void setCycleTime();
@@ -89,14 +92,14 @@ void uploadCmd(WebServer & server, WebServer::ConnectionType type, char * url_ta
 void helpCmd(WebServer &server, WebServer::ConnectionType type, char *url_tail, bool tail_complete);
 void processWebServer();
 void WebServerLaunch();
-void listFiles(uint8_t flags, uint8_t indent);
-void scrollAddress();
-void setClockFace(byte face);
 void readHTML(WebServer &server, const String& htmlfile);
 uint16_t get_mime_type_from_filename(const char* filename);
 void toggleWebServerPriority();
 void webServerCylon();
+void listFiles(uint8_t flags, uint8_t indent);
 void webServerDisplayManager();
+void scrollAddress();
+void setClockFace(byte face);
 void storeGalleryState();
 void resumeGalleryState();
 int cloudCommand(String c);
@@ -115,6 +118,7 @@ void setClockMinute();
 void adjustClock();
 void remoteTest();
 void drawBox(uint8_t r, uint8_t g, uint8_t b);
+void flashBox(uint8_t r, uint8_t g, uint8_t b);
 void APANativeBrightnessCheck();
 void runEffects();
 void plasmaPrime();
@@ -125,6 +129,9 @@ void downloadMode2();
 void downloadIndex();
 int realRandom(int max);
 int realRandom(int min, int max);
+void colorNameToRGB(String colorName, byte *r, byte *g, byte *b);
+void firmwareUpdate_handler(system_event_t event, int param, void* moredata);
+void clearEEPROM();
 
 // Pick an SPI configuration.
 // See SPI configuration section below (comments are for photon).
@@ -211,6 +218,7 @@ DateTime now;
 
 //Global variables
 boolean
+firmwareUpdateReady = false, // use to speedup firmware updates when using system thread
 wifiFolderFound = false, // found the /wifi folder on SD?
 enableWifi = false, // enable wifi?
 resumeFile = false, // are we mid-file when pausing play?
@@ -251,6 +259,7 @@ galleryStateStored = false, // state stored?
 gameInitialized = false;
 
 uint8_t
+readPhase = 0, // debug info for reporting reading from SD
 alertPhase = 0, // 0 = inactive, 1 = running, 2 = ending
 cylonLastLED = 0,
 cylonHUE = 0, // I'm alive indicator during web server
@@ -312,9 +321,9 @@ cylonTime = 0, // used for web server cylon delay
 lastSync = millis(), // last time sync
 colorCorrection = 0xFFFFFF, // color correction setting
 colorTemperature = 0xFFFFFF, // color Temperature
-remoteCodeMenu = 0,
-remoteCodeNext = 0,
-remoteCodePower = 0,
+remoteCodeMenu = 2155864095, // defaults, overridden by remote.ini
+remoteCodeNext = 2155831455,
+remoteCodePower = 2155819215,
 menuPowerCounter = 0, // counter for holding menu button to turn off power
 lastTime = 0, // used to calculate draw time
 drawTime = 0, // time to read from sd
@@ -356,14 +365,57 @@ Abc abc9 { -1, 0};
 // setup application watchdog to reboot if something freezes
 ApplicationWatchdog wd(60000, systemRecover);
 
+/*
+EEPROM MAP
+0 = brightness
+1 = playMode
+2 = cycleTime
+3 = displayMode
+4 = clockSet
+5 = clockFace
+6 = timezone
+10 = networkPass
+80 = networkSSID
+120 = networkAuth
+124 = networkCipher
+130 = staticIP
+134 = netmask
+138 = gateway
+142 = dns
+201 = power state (128 = off, 255 = on)
+*/
+
 void systemRecover()
 {
-  uint8_t recoverFlag = 1;
-  EEPROM.update(200, recoverFlag);
+  Particle.publish("systemStatus","recover");
+  Serial.print("Crash! Read phase: ");
+  Serial.println(readPhase);
+
   System.reset();
 }
 
+void firmwareUpdate_handler(system_event_t event, int param, void* moredata)
+{
+  if (param==firmware_update_failed)
+  {
+    firmwareUpdateReady = false;
+    flashBox(255, 0, 0);
+  }
+  else firmwareUpdateReady = true;
+}
+
 void setup(void) {
+  // register the cloud functions
+  Particle.function("Command", cloudCommand);
+  Particle.function("Next", cloudNext);
+  Particle.function("Power", cloudPower);
+  Particle.function("Play", cloudPlayFolder);
+  Particle.function("Alert", cloudAlert);
+  Particle.function("Brightness", cloudBrightness);
+  Particle.function("Color", cloudColor);
+
+  System.on(firmware_update, firmwareUpdate_handler);
+
   // debug LED setup
   pinMode(STATUS_LED, OUTPUT);
   digitalWrite(STATUS_LED, HIGH);
@@ -404,6 +456,7 @@ void setup(void) {
   // revert to these values if MENU tactile button held on cold boot
   if (digitalRead(buttonMenuPin) == LOW)
   {
+    clearEEPROM();
     brightness = 1;
     stripSetBrightness();
     playMode = 0;
@@ -414,7 +467,7 @@ void setup(void) {
 
   // SD Init
   Serial.print("Init SD: ");
-  if (!sd.begin(SD_CS, SPI_FULL_SPEED)) {
+  if (!sd.begin(SD_CS, SPI_HALF_SPEED)) {
     Serial.println("fail");
     // SD error message
     sdErrorMessage(0, 255, 0);
@@ -434,31 +487,8 @@ void setup(void) {
   networkConnect();
   if (!wifiFolderFound)
   {
-    drawBox(255, 165, 0);
-    delay(75);
-    clearStripBuffer();
-    FastLED.show();
-    delay(75);
-    drawBox(255, 165, 0);
-    delay(75);
-    clearStripBuffer();
-    FastLED.show();
-    delay(75);
-    drawBox(255, 165, 0);
-    delay(75);
-    clearStripBuffer();
-    FastLED.show();
-    delay(75);
-    drawBox(255, 165, 0);
-    delay(75);
-    clearStripBuffer();
-    FastLED.show();
-    delay(75);
-    drawBox(255, 165, 0);
-    delay(75);
-    clearStripBuffer();
-    FastLED.show();
-    delay(75);
+    // flash orange box
+    flashBox(255, 165, 0);
   }
 
   if (Particle.connected())
@@ -466,18 +496,12 @@ void setup(void) {
     // get time zone
     EEPROM.get(6, timeZone);
     setTimeZone();
-    // scroll the IP address across the screen
-    scrollAddress();
+    // scroll the IP address across the screen (if not recovering from power down state)
+    uint8_t powerState;
+    EEPROM.get(201, powerState);
+    if (powerState != 128) scrollAddress();
     // web server setup
     WebServerLaunch();
-    // register the cloud functions
-    Particle.function("Command", cloudCommand);
-    Particle.function("Next", cloudNext);
-    Particle.function("Power", cloudPower);
-    Particle.function("Play", cloudPlayFolder);
-    Particle.function("Alert", cloudAlert);
-    Particle.function("Brightness", cloudBrightness);
-    Particle.function("Color", cloudColor);
   }
   else
   {
@@ -560,14 +584,7 @@ void setup(void) {
 
   if (Particle.connected())
   {
-    output = EEPROM.read(200);
-    if (output == 0) Particle.publish("systemStatus","boot");
-    else
-    {
-      uint8_t recoverFlag = 0;
-      EEPROM.update(200, recoverFlag);
-      Particle.publish("systemStatus","recover");
-    }
+    Particle.publish("systemStatus","boot");
   }
   digitalWrite(D7, LOW); // turn off Photon LED
 }
@@ -596,6 +613,8 @@ void initGameFrame()
   // apply automatic brightness if enabled
   if (abc) applyCurrentABC();
   // reset vars
+  currentEffect = 0;
+  secondCounter = 0;
   menuMode = 0;
   displayFolderCount = false;
   webServerActive = false;
@@ -657,10 +676,23 @@ void initGameFrame()
   // sync clock with RTC if offline
   if (!Particle.connected()) syncClock(true);
 
-  // play logo animation
-  sd.chdir("/00system/logo");
-  readIniFile();
-  drawFrame();
+  // check for reboot recovery from off state
+  uint8_t powerState;
+  EEPROM.get(201, powerState);
+  if (powerState == 128) framePowered = false;
+  else framePowered = true;
+  if (!framePowered)
+  {
+    framePowerDown();
+  }
+
+  else
+  {
+    // play logo animation
+    sd.chdir("/00system/logo");
+    readIniFile();
+    drawFrame();
+  }
 }
 
 void applyCurrentABC()
@@ -763,6 +795,18 @@ void remoteTest()
       alertPhase = 0; // enable alerts
       return;
     }
+  }
+}
+
+// flash a box
+void flashBox(uint8_t r, uint8_t g, uint8_t b)
+{
+  for (int i=0; i<8; i++)
+  {
+    drawBox(r, g, g);
+    delay(75);
+    drawBox(0, 0, 0);
+    delay(75);
   }
 }
 
@@ -1088,6 +1132,23 @@ void irReceiver()
 
 void powerControl()
 {
+  if (firmwareUpdateReady)
+  {
+    // draw WIFI graphic
+    if (!framePowered) EEPROM.update(201, 255); // store power on state
+    closeMyFile();
+    offsetX = 0;
+    offsetY = 0;
+    singleGraphic = false;
+    Serial.println("Firmware update!");
+    bmpDraw("/00system/wifi/wifi.bmp", 0, 0);
+    FastLED.show();
+    while(firmwareUpdateReady)
+    {
+      // update and chill
+      Particle.process();
+    }
+  }
   if (irCommand == 'P')
   {
     // abc brightness set to zero; turn display on
@@ -1103,9 +1164,16 @@ void powerControl()
     {
       framePowered = !framePowered;
       // power down
-      if (!framePowered) framePowerDown();
+      if (!framePowered)
+      {
+        framePowerDown();
+      }
       // power restored
-      else initGameFrame();
+      else
+      {
+        EEPROM.update(201, 255); // store power state
+        initGameFrame();
+      }
     }
   }
   // allow power toggle by holding down physical Menu button on PCB
@@ -1128,6 +1196,7 @@ void powerControl()
 
 void framePowerDown()
 {
+  Serial.println("Powering down.");
   webServerActive = false;
   menuActive = false;
   if (breakout == true)
@@ -1135,6 +1204,7 @@ void framePowerDown()
     breakout = false;
     ballMoving = false;
   }
+  EEPROM.update(201, 128); // store power down state
   clearStripBuffer();
   FastLED.show();
 }
@@ -1434,10 +1504,11 @@ void mainLoop()
       }
       swapTime = swapTime + (millis() - menuEnterTime);
       baseTime = baseTime + (millis() - menuEnterTime);
-      if (abortImage == false)
+      if (abortImage == false && displayMode == 0)
       {
         drawFrame();
       }
+      else clearStripBuffer();
     }
   }
 
@@ -1494,11 +1565,15 @@ void mainLoop()
         }
       }
 
-      // animate if not a single-frame & animations are on; always animate the logo
-      if (holdTime != -1 && playMode != 2 || logoPlayed == false)
+      if (displayMode == 2 && alertPhase == 0 && logoPlayed == true) // effects mode
       {
-        if (displayMode == 2 && alertPhase == 0 && logoPlayed == true) runEffects(); // plasma
-        else if (millis() >= swapTime && clockShown == false)
+        runEffects();
+      }
+
+      // animate if not a single-frame & animations are on; always animate the logo
+      else if (holdTime != -1 && playMode != 2 || logoPlayed == false)
+      {
+        if (millis() >= swapTime && clockShown == false)
         {
           statusLedFlicker();
           swapTime = millis() + holdTime;
@@ -2147,7 +2222,10 @@ void bmpDraw(char *filename, int x, int y) {
               leds[getIndex(col, row)] = CRGB(0, 0, 0);
             }
             // all good
-            else leds[getIndex(col + x, row)] = CRGB(r, g, b);
+            else
+            {
+              leds[getIndex(col + x, row)] = CRGB(r, g, b);
+            }
             // paint pixel color
           } // end pixel
         } // end scanline
@@ -2991,18 +3069,22 @@ void APANativeBrightnessCheck()
   }
 }
 
+void clearEEPROM()
+{
+  Serial.println("Clearing EEPROM...");
+  for (int i = 0 ; i < 201 ; i++)
+  {
+    EEPROM.update(i, 0);
+  }
+  Serial.println("Done!");
+}
+
 void networkConnect()
 {
 
-/*
-  // clearEEPROM
-  Serial.println("Clearing EEPROM...");
-  for (int i = 0 ; i < 200 ; i++)
-  {
-    EEPROM.write(i, 0);
-  }
-  Serial.println("Done!");
-*/
+  // are we recovering from a powered down state?
+  uint8_t powerState;
+  EEPROM.get(201, powerState);
 
   // read network.ini
   bool iniExists = false;
@@ -3101,7 +3183,7 @@ void networkConnect()
     Serial.println(networkSSID);
     for (byte i=0; i<64; i++)
     {
-      if (networkSSID[i] != networkSSIDEEPROM[i])
+      if (networkSSID[i] != networkSSIDEEPROM[i] && useIniWifi)
       {
         Serial.println("New SSID");
         newCredentials = true;
@@ -3124,7 +3206,7 @@ void networkConnect()
     Serial.println(networkPass);
     for (byte i=0; i<32; i++)
     {
-      if (networkPass[i] != networkPassEEPROM[i])
+      if (networkPass[i] != networkPassEEPROM[i] && useIniWifi)
       {
         Serial.println("New Password");
         newCredentials = true;
@@ -3150,7 +3232,7 @@ void networkConnect()
     printErrorMessage(ini.getError());
   }
   // save to EEPROM
-  if (authValue != authEEPROM)
+  if (authValue != authEEPROM && useIniWifi)
   {
     Serial.println("New WIFI security");
     EEPROM.put(120, authValue);
@@ -3171,7 +3253,7 @@ void networkConnect()
     printErrorMessage(ini.getError());
   }
   // save to EEPROM
-  if (cipherValue != cipherEEPROM)
+  if (cipherValue != cipherEEPROM && useIniWifi)
   {
     Serial.println("New WIFI cipher");
     EEPROM.put(124, cipherValue);
@@ -3210,11 +3292,14 @@ void networkConnect()
       // check against EEPROM
       if (i0 != EEPROM.read(130) || i1 != EEPROM.read(131) || i2 != EEPROM.read(132) || i3 != EEPROM.read(133))
       {
-        EEPROM.update(130, i0);
-        EEPROM.update(131, i1);
-        EEPROM.update(132, i2);
-        EEPROM.update(133, i3);
-        newStaticIP = true;
+        if (useIniWifi)
+        {
+          EEPROM.update(130, i0);
+          EEPROM.update(131, i1);
+          EEPROM.update(132, i2);
+          EEPROM.update(133, i3);
+          newStaticIP = true;
+        }
       }
 
       Serial.print("static ip: ");
@@ -3246,11 +3331,14 @@ void networkConnect()
       // check against EEPROM
       if (i0 != EEPROM.read(134) || i1 != EEPROM.read(135) || i2 != EEPROM.read(136) || i3 != EEPROM.read(137))
       {
-        EEPROM.update(134, i0);
-        EEPROM.update(135, i1);
-        EEPROM.update(136, i2);
-        EEPROM.update(137, i3);
-        newStaticIP = true;
+        if (useIniWifi)
+        {
+          EEPROM.update(134, i0);
+          EEPROM.update(135, i1);
+          EEPROM.update(136, i2);
+          EEPROM.update(137, i3);
+          newStaticIP = true;
+        }
       }
 
       Serial.print("netmask: ");
@@ -3282,11 +3370,14 @@ void networkConnect()
       // check against EEPROM
       if (i0 != EEPROM.read(138) || i1 != EEPROM.read(139) || i2 != EEPROM.read(140) || i3 != EEPROM.read(141))
       {
-        EEPROM.update(138, i0);
-        EEPROM.update(139, i1);
-        EEPROM.update(140, i2);
-        EEPROM.update(141, i3);
-        newStaticIP = true;
+        if (useIniWifi)
+        {
+          EEPROM.update(138, i0);
+          EEPROM.update(139, i1);
+          EEPROM.update(140, i2);
+          EEPROM.update(141, i3);
+          newStaticIP = true;
+        }
       }
 
       Serial.print("gateway: ");
@@ -3318,11 +3409,14 @@ void networkConnect()
       // check against EEPROM
       if (i0 != EEPROM.read(142) || i1 != EEPROM.read(143) || i2 != EEPROM.read(144) || i3 != EEPROM.read(145))
       {
-        EEPROM.update(142, i0);
-        EEPROM.update(143, i1);
-        EEPROM.update(144, i2);
-        EEPROM.update(145, i3);
-        newStaticIP = true;
+        if (useIniWifi)
+        {
+          EEPROM.update(142, i0);
+          EEPROM.update(143, i1);
+          EEPROM.update(144, i2);
+          EEPROM.update(145, i3);
+          newStaticIP = true;
+        }
       }
 
       Serial.print("dns: ");
@@ -3364,7 +3458,8 @@ void networkConnect()
       }
 
       if (Particle.connected() == false && iniExists) {
-        bmpDraw("/00system/wifi/white.bmp", 0, 0);
+        // don't draw graphic if recovering from power off state
+        if (powerState != 128) bmpDraw("/00system/wifi/white.bmp", 0, 0);
         Serial.println("WiFi On...");
         WiFi.on();
         if (newCredentials)
@@ -3389,12 +3484,28 @@ void networkConnect()
         WiFi.connect(WIFI_CONNECT_SKIP_LISTEN);
         if (WiFi.hasCredentials())
         {
-          Serial.println("We have Credentials! Connecting to Cloud...");
+          Serial.println("We have Credentials! Connecting to Cloudz...");
           Particle.connect();
-          bmpDraw("/00system/wifi/green.bmp", 0, 0);
+          // don't draw graphic if recovering from power off state
+          if (powerState != 128) bmpDraw("/00system/wifi/green.bmp", 0, 0);
+          long connectTimeout = millis() + 30000;
+          long progressMeter = millis() + 500;
           while(!Particle.connected())
           {
             Particle.process();
+            // timneout if no connection is established
+            // system will continue trying in the background
+            if (millis() > connectTimeout)
+            {
+              bmpDraw("/00system/wifi/red.bmp", 0, 0);
+              delay(2000);
+              break;
+            }
+            if (millis() > progressMeter)
+            {
+              Serial.print(".");
+              progressMeter += 500;
+            }
           }
           Serial.println("Connected to:");
           Serial.println(WiFi.localIP());
@@ -3403,14 +3514,71 @@ void networkConnect()
           Serial.println(WiFi.SSID());
           randomSeed(Time.now());
         }
-        else Serial.println("We have NO Credentials.");
+        else
+        {
+          // If INI credentials match EEPROM but stored credentials are missing...
+          Serial.println("Credential loss detected. Restoring from INI.");
+          WiFi.disconnect();
+          Serial.println("Clearing Credentials...");
+          WiFi.clearCredentials();
+
+          // set Credentials
+          Serial.println("Setting New Credentials...");
+          if (authValue > -1 && cipherValue > -1)
+          {
+            WiFi.setCredentials(networkSSID, networkPass, authValue, cipherValue);
+          }
+          else if (authValue > -1)
+          {
+            WiFi.setCredentials(networkSSID, networkPass, authValue);
+          }
+          else WiFi.setCredentials(networkSSID, networkPass);
+
+          WiFi.connect(WIFI_CONNECT_SKIP_LISTEN);
+
+          // let's try this again
+          if (WiFi.hasCredentials())
+          {
+            Serial.println("We have Credentials! Connecting to Cloud...");
+            Particle.connect();
+            // don't draw graphic if recovering from power off state
+            if (powerState != 128) bmpDraw("/00system/wifi/green.bmp", 0, 0);
+            long connectTimeout = millis() + 30000;
+            long progressMeter = millis() + 500;
+            while(!Particle.connected())
+            {
+              Particle.process();
+              // timneout if no connection is established
+              // system will continue trying in the background
+              if (millis() > connectTimeout)
+              {
+                bmpDraw("/00system/wifi/red.bmp", 0, 0);
+                delay(2000);
+                break;
+              }
+              if (millis() > progressMeter)
+              {
+                Serial.print(".");
+                progressMeter += 500;
+              }
+            }
+            Serial.println("Connected to:");
+            Serial.println(WiFi.localIP());
+            Serial.println(WiFi.subnetMask());
+            Serial.println(WiFi.gatewayIP());
+            Serial.println(WiFi.SSID());
+            randomSeed(Time.now());
+          }
+          else Serial.println("We have NO Credentials.");
+        }
       }
     }
     // use stored credentials
     else
     {
       if (Particle.connected() == false && iniExists) {
-        bmpDraw("/00system/wifi/white.bmp", 0, 0);
+        // don't draw graphic if recovering from power off state
+        if (powerState != 128) bmpDraw("/00system/wifi/white.bmp", 0, 0);
         Serial.println("WiFi On...");
         WiFi.on();
         Serial.println("Using stored credentials...");
@@ -3419,10 +3587,26 @@ void networkConnect()
         {
           Serial.println("We have Credentials! Connecting to Cloud...");
           Particle.connect();
-          bmpDraw("/00system/wifi/green.bmp", 0, 0);
+          // don't draw graphic if recovering from power off state
+          if (powerState != 128) bmpDraw("/00system/wifi/green.bmp", 0, 0);
+          long connectTimeout = millis() + 30000;
+          long progressMeter = millis() + 500;
           while(!Particle.connected())
           {
             Particle.process();
+            // timneout if no connection is established
+            // system will continue trying in the background
+            if (millis() > connectTimeout)
+            {
+              bmpDraw("/00system/wifi/red.bmp", 0, 0);
+              delay(2000);
+              break;
+            }
+            if (millis() > progressMeter)
+            {
+              Serial.print(".");
+              progressMeter += 500;
+            }
           }
           Serial.println("Connected to:");
           Serial.println(WiFi.localIP());
@@ -3881,7 +4065,7 @@ void breakoutLoop()
     {
       ballMoving = true;
       // ball speed
-      if (enableWifi) swapTime = 150;
+      if (enableWifi) swapTime = 1000;
       else swapTime = 2500;
       ballAngle = random8(190, 225);
     }
@@ -3899,7 +4083,7 @@ void breakoutLoop()
     {
       ballMoving = true;
       // ball speed
-      if (enableWifi) swapTime = 150;
+      if (enableWifi) swapTime = 1000;
       else swapTime = 2500;
       ballAngle = random8(135, 170);
     }
@@ -3918,7 +4102,7 @@ void breakoutLoop()
     {
       ballMoving = false;
       breakout = false;
-      Serial.print(F("Lose!!!"));
+      Serial.println("Lose!!!");
       for (int c = 250; c >= 0; c = c - 10)
       {
         for (int i = 0; i < NUM_LEDS; i++)
@@ -3994,13 +4178,13 @@ void breakoutLoop()
       if (leds[ballIndex].r > 0 || leds[ballIndex].g > 0 || leds[ballIndex].b > 0)
       {
         // speed up and change direction
-        if (enableWifi) swapTime -= 1;
+        if (enableWifi) swapTime -= 5;
         else swapTime -= 20;
 
         swapYdirection();
         if (winCheck())
         {
-          Serial.print(F("Win!!!"));
+          Serial.println("Win!!!");
           for (byte flashes=0; flashes < 30; flashes++)
           {
             leds[ballIndex] = CRGB(random8(), random8(), random8());
@@ -4135,15 +4319,19 @@ float degToRad(float deg)
 // May need to reverse subscript order if porting elsewhere.
 
 uint16_t read16(SdFile& f) {
+  readPhase = 16;
   uint16_t result;
   f.read(&result, 2);
   return result;
+  readPhase = 0;
 }
 
 uint32_t read32(SdFile& f) {
+  readPhase = 32;
   uint32_t result;
   f.read(&result, 4);
   return result;
+  readPhase = 0;
 }
 
 // clock debug function
@@ -4414,187 +4602,6 @@ void webServerCylon()
     FastLED.show();
     cylonTime = millis() + 10;
   }
-}
-
-void webServerDisplayManager()
-{
-  if (webServerActive)
-  {
-    offsetBufferX = offsetX;
-    offsetBufferY = offsetY;
-    offsetX = 0;
-    offsetY = 0;
-    if (framePowered) bmpDraw("/00system/wifi/wifi.bmp", 0, 0);
-    closeMyFile();
-    /*
-    // desaturate screen if animations paused
-    for (int i = 0; i < 256; i++)
-    {
-      uint8_t luma = leds[i].getLuma();
-      leds[i] = CRGB(luma, luma, luma);
-    }
-    */
-    FastLED.show();
-  }
-  // exit web priority
-  else
-  {
-    offsetX = offsetBufferX;
-    offsetY = offsetBufferY;
-    if (displayMode == 1) initClock();
-    else if (displayMode == 0) drawFrame();
-  }
-}
-
-void storeGalleryState()
-{
-  // store current animation info
-  Serial.println("Storing gallery state...");
-  galleryStateStored = true;
-
-  if (displayMode == 1) // clock mode
-  {
-    closeMyFile();
-    clockAnimationActive = false;
-    clockShown = false;
-    abortImage = true;
-    chainIndex = -1;
-    nextFolder[0] = '\0';
-  }
-
-  if (chainIndex > -1)
-  {
-    char chainChar[6];
-    strcpy(currentDirectory, chainRootFolder);
-    strcat(currentDirectory, "/");
-    itoa(chainIndex-1, chainChar, 10);
-    strcat(currentDirectory, chainChar);
-    chainIndexBuffer = chainIndex;
-    chainIndex = -1;
-  }
-  else
-  {
-    sd.vwd()->getName(currentDirectory, 24);
-  }
-  resumeFile = false;
-  currentFile[0] = '\0';
-  currentFilePosition = 0; // stores current position when using web server
-  if (myFile.isOpen())
-  {
-    resumeFile = true;
-    myFile.getName(currentFile, 13); // store current file
-    Serial.print("File is open. Saving position of: ");
-    Serial.print(currentDirectory);
-    Serial.print("/");
-    Serial.println(currentFile);
-    currentFilePosition = myFile.curPosition();
-    closeMyFile();
-  }
-  sd.chdir("/");
-  singleGraphicBuffer = singleGraphic;
-  secondCounterBuffer = secondCounter;
-  fileIndexBuffer = fileIndex;
-  fileIndex = 0;
-  offsetBufferX = offsetX;
-  offsetBufferY = offsetY;
-  offsetX = 0;
-  offsetY = 0;
-  imageWidthBuffer = imageWidth;
-  imageHeightBuffer = imageHeight;
-  if (framePowered && alertPhase == 0 && brightness > 0)
-  {
-    bmpDraw("/00system/wifi/wifi.bmp", 0, 0);
-    FastLED.show();
-    closeMyFile();
-  }
-}
-
-void resumeGalleryState()
-{
-  if (displayMode == 1)
-  {
-    Serial.println("Re-initializing Clock...");
-    galleryStateStored = false;
-    initClock();
-    return;
-  }
-  sd.chdir("/");
-  Serial.print("Returning to: ");
-  Serial.println(currentDirectory);
-  if (!sd.chdir(currentDirectory))
-  {
-    Serial.println("Failed to chdir! Advancing to next image.");
-    resumeFile = false;
-    nextImage();
-    return;
-  }
-  setCycleTime();
-  chainIndex = chainIndexBuffer;
-  singleGraphic = singleGraphicBuffer;
-  secondCounter = secondCounterBuffer;
-  fileIndex = fileIndexBuffer;
-  offsetX = offsetBufferX;
-  offsetY = offsetBufferY;
-  imageWidth = imageWidthBuffer;
-  imageHeight = imageHeightBuffer;
-  if (framePowered)
-  {
-    if (chainIndex > -1)
-    {
-      char rootFolderConfig[20];
-      strcpy(rootFolderConfig, "/");
-      strcat(rootFolderConfig, chainRootFolder);
-      strcat(rootFolderConfig, "/config.ini");
-      if (sd.exists(rootFolderConfig))
-      {
-        sd.chdir("/");
-        sd.chdir(chainRootFolder);
-        Serial.print(F("Opening Root File: "));
-        Serial.print(chainRootFolder);
-        Serial.println(F("/config.ini"));
-        readIniFile();
-        sd.chdir("/");
-        sd.chdir(currentDirectory);
-      }
-      else
-      {
-        Serial.print(F("Opening File: "));
-        Serial.print(currentDirectory);
-        Serial.println(F("/config.ini"));
-        readIniFile();
-      }
-    }
-    else
-    {
-      Serial.print(F("Opening File: "));
-      Serial.print(currentDirectory);
-      Serial.println(F("/config.ini"));
-      readIniFile();
-    }
-    if (resumeFile)
-    {
-      Serial.print("Re-opening: ");
-      if (currentDirectory[0] != '/') Serial.print("/");
-      Serial.print(currentDirectory);
-      if (currentDirectory[0] != '/') Serial.print("/");
-      Serial.print(currentFile);
-      Serial.print(" at ");
-      Serial.println(currentFilePosition);
-      myFile.open(currentFile, O_READ);
-      myFile.seekSet(currentFilePosition);
-    }
-    swapTime = millis() + holdTime;
-    drawFrame();
-  }
-  galleryStateStored = false;
-}
-
-void toggleWebServerPriority()
-{
-  webServerActive = !webServerActive;
-  if (webServerActive) storeGalleryState();
-  webServerDisplayManager();
-  if (webServerActive) resumeGalleryState();
 }
 
 void commandCmd(WebServer &server, WebServer::ConnectionType type, char *url_tail, bool tail_complete)
@@ -4999,9 +5006,7 @@ void helpCmd(WebServer &server, WebServer::ConnectionType type, char *url_tail, 
   // readHTML(server, "/00system/wifi/index.htm");
 
   server.println("<hr>");
-  server.println("<p><input type='button' value='Activate FX Mode' onclick='funky(\"set?fx\")'></form> (Downloads a new menu graphic that enables a real-time effects mode in addition to Gallery & Clock. FX Mode is a work-in-progress.)\n");
-  server.println("<hr>");
-  server.println("<p><input type='button' value='Restore Index.html' onclick='funky(\"set?index\")'></form> (Downloads the most current index.html file used for the main control panel.)\n");
+  server.println("<p><input type='button' value='Restore Index.html' onclick='funky(\"set?index\")'></form> (Restore index.html file used for the main control panel.)\n");
   server.println("<hr>");
   server.println("<p>Replace index.html:</p>");
   server.println("<p><form method='post' enctype='multipart/form-data' id='uploader' action='/upload' method='POST'>");
@@ -5174,10 +5179,10 @@ uint16_t get_mime_type_from_filename(const char* filename) {
         p++; i++;
         ch = mime_types[i];
       }
-      if (!*p && ch == '*') { 	// We reached the end of the extension while checking
+      if (!*p && ch == '*') {   // We reached the end of the extension while checking
         r = ++i;   // equality with a MIME type: we have a match. Increment i
-        break;    	// to reach past the '*' char, and assign it to `mime_type'.
-      } else { 	// Skip past the the '|' character indicating the end of a MIME type.
+        break;      // to reach past the '*' char, and assign it to `mime_type'.
+      } else {  // Skip past the the '|' character indicating the end of a MIME type.
         while (mime_types[i++] != '|');
       }
     }
@@ -5362,9 +5367,206 @@ void processWebServer()
     webserver.processConnection(buff, &len);
 
     // I'm alive effect
-    webServerCylon();
+    /*webServerCylon();*/
   }
 }
+
+void storeGalleryState()
+{
+  // store current animation info
+  Serial.println("Storing gallery state...");
+  galleryStateStored = true;
+
+  if (displayMode == 1) // clock mode
+  {
+    closeMyFile();
+    clockAnimationActive = false;
+    clockShown = false;
+    abortImage = true;
+    chainIndex = -1;
+    nextFolder[0] = '\0';
+  }
+
+  if (chainIndex > -1)
+  {
+    char chainChar[6];
+    strcpy(currentDirectory, chainRootFolder);
+    strcat(currentDirectory, "/");
+    itoa(chainIndex-1, chainChar, 10);
+    strcat(currentDirectory, chainChar);
+    chainIndexBuffer = chainIndex;
+    chainIndex = -1;
+  }
+  else
+  {
+    sd.vwd()->getName(currentDirectory, 24);
+  }
+  resumeFile = false;
+  currentFile[0] = '\0';
+  currentFilePosition = 0; // stores current position when using web server
+  if (myFile.isOpen())
+  {
+    resumeFile = true;
+    myFile.getName(currentFile, 13); // store current file
+    Serial.print("File is open. Saving position of: ");
+    Serial.print(currentDirectory);
+    Serial.print("/");
+    Serial.println(currentFile);
+    currentFilePosition = myFile.curPosition();
+    closeMyFile();
+  }
+  sd.chdir("/");
+  singleGraphicBuffer = singleGraphic;
+  secondCounterBuffer = secondCounter;
+  fileIndexBuffer = fileIndex;
+  fileIndex = 0;
+  offsetBufferX = offsetX;
+  offsetBufferY = offsetY;
+  offsetX = 0;
+  offsetY = 0;
+  imageWidthBuffer = imageWidth;
+  imageHeightBuffer = imageHeight;
+  if (framePowered && alertPhase == 0 && brightness > 0)
+  {
+    bmpDraw("/00system/wifi/wifi.bmp", 0, 0);
+    FastLED.show();
+    closeMyFile();
+  }
+}
+
+void resumeGalleryState()
+{
+  if (displayMode == 1)
+  {
+    Serial.println("Re-initializing Clock...");
+    galleryStateStored = false;
+    initClock();
+    return;
+  }
+  else if (displayMode == 2)
+  {
+    Serial.println("Returning to FX...");
+    galleryStateStored = false;
+    chainIndex = chainIndexBuffer;
+    singleGraphic = singleGraphicBuffer;
+    secondCounter = secondCounterBuffer;
+    fileIndex = fileIndexBuffer;
+    offsetX = offsetBufferX;
+    offsetY = offsetBufferY;
+    imageWidth = imageWidthBuffer;
+    imageHeight = imageHeightBuffer;
+    clearStripBuffer();
+    return;
+  }
+  sd.chdir("/");
+  Serial.print("Returning to: ");
+  Serial.println(currentDirectory);
+  if (!sd.chdir(currentDirectory))
+  {
+    Serial.println("Failed to chdir! Advancing to next image.");
+    resumeFile = false;
+    nextImage();
+    return;
+  }
+  setCycleTime();
+  chainIndex = chainIndexBuffer;
+  singleGraphic = singleGraphicBuffer;
+  secondCounter = secondCounterBuffer;
+  fileIndex = fileIndexBuffer;
+  offsetX = offsetBufferX;
+  offsetY = offsetBufferY;
+  imageWidth = imageWidthBuffer;
+  imageHeight = imageHeightBuffer;
+  if (framePowered)
+  {
+    if (chainIndex > -1)
+    {
+      char rootFolderConfig[20];
+      strcpy(rootFolderConfig, "/");
+      strcat(rootFolderConfig, chainRootFolder);
+      strcat(rootFolderConfig, "/config.ini");
+      if (sd.exists(rootFolderConfig))
+      {
+        sd.chdir("/");
+        sd.chdir(chainRootFolder);
+        Serial.print(F("Opening Root File: "));
+        Serial.print(chainRootFolder);
+        Serial.println(F("/config.ini"));
+        readIniFile();
+        sd.chdir("/");
+        sd.chdir(currentDirectory);
+      }
+      else
+      {
+        Serial.print(F("Opening File: "));
+        Serial.print(currentDirectory);
+        Serial.println(F("/config.ini"));
+        readIniFile();
+      }
+    }
+    else
+    {
+      Serial.print(F("Opening File: "));
+      Serial.print(currentDirectory);
+      Serial.println(F("/config.ini"));
+      readIniFile();
+    }
+    if (resumeFile)
+    {
+      Serial.print("Re-opening: ");
+      if (currentDirectory[0] != '/') Serial.print("/");
+      Serial.print(currentDirectory);
+      if (currentDirectory[0] != '/') Serial.print("/");
+      Serial.print(currentFile);
+      Serial.print(" at ");
+      Serial.println(currentFilePosition);
+      myFile.open(currentFile, O_READ);
+      myFile.seekSet(currentFilePosition);
+    }
+    swapTime = millis() + holdTime;
+    drawFrame();
+  }
+  galleryStateStored = false;
+}
+
+void toggleWebServerPriority()
+{
+  webServerActive = !webServerActive;
+  if (webServerActive) storeGalleryState();
+  webServerDisplayManager();
+  if (webServerActive) resumeGalleryState();
+}
+
+void webServerDisplayManager()
+{
+  if (webServerActive)
+  {
+    offsetBufferX = offsetX;
+    offsetBufferY = offsetY;
+    offsetX = 0;
+    offsetY = 0;
+    if (framePowered) bmpDraw("/00system/wifi/wifi.bmp", 0, 0);
+    closeMyFile();
+    /*
+    // desaturate screen if animations paused
+    for (int i = 0; i < 256; i++)
+    {
+      uint8_t luma = leds[i].getLuma();
+      leds[i] = CRGB(luma, luma, luma);
+    }
+    */
+    FastLED.show();
+  }
+  // exit web priority
+  else
+  {
+    offsetX = offsetBufferX;
+    offsetY = offsetBufferY;
+    if (displayMode == 1) initClock();
+    else if (displayMode == 0) drawFrame();
+  }
+}
+
 
 // scroll the local IP address across screen
 void scrollAddress()
@@ -5374,34 +5576,41 @@ void scrollAddress()
   IPAddress myAddr = WiFi.localIP();
   int x = 0;
   int scroll = 16; // cursor position starts off screen
+  long scrollTick = 0;
   // each draw pass of the scroll
   while (x >= -3)
   {
-    clearStripBuffer();
-    int xDrawShift = 0;
-    // each octet
-    for (byte o=0; o<4; o++)
+    // allow the user to skip with NEXT button
+    irReceiver();
+    if (irCommand == 'N') break;
+    if (millis() > scrollTick)
     {
-      byte octet = myAddr[o];
-      char a[4];
-      itoa(octet, a, 10);
-      byte numDigits;
-      if (octet >= 100) numDigits=3;
-      else if (octet >= 10) numDigits=2;
-      else numDigits=1;
-      // each character
-      for (byte i=0; i<numDigits; i++)
+      scrollTick = millis() + 75; // ip address scroll speed
+      clearStripBuffer();
+      int xDrawShift = 0;
+      // each octet
+      for (byte o=0; o<4; o++)
       {
-        offsetY = ((a[i] - '0') * 16); // read number from digits BMP
-        x = xDrawShift + scroll; // write at the correct column
-        bmpDraw("/00system/digits_2.bmp", x, 0);
-        xDrawShift += 4; // shift cursor to next character
+        byte octet = myAddr[o];
+        char a[4];
+        itoa(octet, a, 10);
+        byte numDigits;
+        if (octet >= 100) numDigits=3;
+        else if (octet >= 10) numDigits=2;
+        else numDigits=1;
+        // each character
+        for (byte i=0; i<numDigits; i++)
+        {
+          offsetY = ((a[i] - '0') * 16); // read number from digits BMP
+          x = xDrawShift + scroll; // write at the correct column
+          bmpDraw("/00system/digits_2.bmp", x, 0);
+          xDrawShift += 4; // shift cursor to next character
+        }
+        xDrawShift += 2; // leave space between octets
       }
-      xDrawShift += 2; // leave space between octets
+      FastLED.show();
+      scroll--; // scroll left
     }
-    FastLED.show();
-    scroll--; // scroll left
-    delay(50);
   }
   closeMyFile();
 }
@@ -5418,6 +5627,7 @@ int cloudCommand(String c)
   command = strtok(cmd, " ");
   command[0] = tolower(command[0]);
   parameter = strtok(NULL, " ");
+  parameter[0] = tolower(parameter[0]);
   Serial.println("Cloud Command!");
   Serial.print("Command: ");
   Serial.println(command);
@@ -5483,7 +5693,17 @@ int cloudCommand(String c)
   else if (strcmp(command, "playback") == 0)
   {
     Serial.println("Changing playback mode.");
-    uint8_t newPlayback = atoi(parameter);
+    uint8_t newPlayback = playMode;
+
+    if (isDigit(parameter[0])) newPlayback = atoi(parameter);
+
+    // accept "on" or "off" text for Alexa compatibility. Controls shuffle mode.
+    else
+    {
+      if (strcmpi(parameter, "on") == 0) newPlayback = 1;
+      else if (strcmpi(parameter, "off") == 0) newPlayback = 0;
+    }
+
     if (newPlayback < 3)
     {
       playMode = newPlayback;
@@ -5495,7 +5715,29 @@ int cloudCommand(String c)
   {
     Serial.println("Display mode change requested.");
     uint8_t oldMode = displayMode;
-    uint8_t newMode = atoi(parameter);
+    uint8_t newMode = displayMode;
+
+    // explicit display mode number provided
+    if (isDigit(parameter[0])) newMode = atoi(parameter);
+
+    // text received, must convert
+    else if (strcmp(parameter, "gallery") == 0
+      || strcmp(parameter, "graphics") == 0
+      || strcmp(parameter, "pictures") == 0
+      || strcmp(parameter, "animation") == 0
+      || strcmp(parameter, "animations") ==0)
+    {
+      newMode = 0;
+    }
+    else if (strcmp(parameter, "clock") == 0 || strcmp(parameter, "time") == 0)
+    {
+      newMode = 1;
+    }
+    else if (strcmp(parameter, "effect") == 0 || strcmp(parameter, "effects") == 0)
+    {
+      newMode = 2;
+    }
+
     if (newMode <= displayModeMax && newMode != oldMode)
     {
       displayMode = newMode;
@@ -5521,7 +5763,25 @@ int cloudCommand(String c)
   else if (strcmp(command, "cycle") == 0)
   {
     Serial.println("Changing cycle interval.");
-    uint8_t newSetting = atoi(parameter);
+    uint8_t newSetting;
+
+    if (isDigit(parameter[0])) newSetting = atoi(parameter);
+
+    // alexa compatibility
+    else
+    {
+      if (strcmpi(parameter, "PT10S") == 0) newSetting = 1;
+      else if (strcmpi(parameter, "PT30S") == 0) newSetting = 2;
+      else if (strcmpi(parameter, "PT1M") == 0) newSetting = 3;
+      else if (strcmpi(parameter, "PT5M") == 0) newSetting = 4;
+      else if (strcmpi(parameter, "PT15M") == 0) newSetting = 5;
+      else if (strcmpi(parameter, "PT30M") == 0) newSetting = 6;
+      else if (strcmpi(parameter, "PT1H") == 0) newSetting = 7;
+      // workaround for AMAZON.DURATION not supporting infinity (use 1 year instead)
+      else if (strcmpi(parameter, "P1Y") == 0) newSetting = 8;
+      else if (strcmpi(parameter, "infinity") == 0) newSetting = 8;
+    }
+
     if (newSetting <= 8 && newSetting > 0)
     {
       cycleTimeSetting = newSetting;
@@ -5629,6 +5889,7 @@ int cloudPower(String c)
     }
     else if (!framePowered)
     {
+      EEPROM.update(201, 255); // store power state
       initGameFrame();
       framePowered = true;
     }
@@ -5704,28 +5965,36 @@ int cloudAlert(String c)
 
     delay(100);
 
-    if (displayMode == 0 || displayMode == 2)
+    if (sd.exists(nextFolder))
     {
-      // only store gallery state once in case of multiple alerts
-      if (alertPhase == 0 || alertPhase == 2)
+      if (displayMode == 0 || displayMode == 2)
+      {
+        // only store gallery state once in case of multiple alerts
+        if (alertPhase == 0 || alertPhase == 2)
+        {
+          alertPhase = 1;
+          storeGalleryState();
+        }
+        nextImage();
+        drawFrame();
+      }
+      else if (displayMode == 1)
       {
         alertPhase = 1;
-        storeGalleryState();
+        offsetX = 0;
+        offsetY = 0;
+        secondCounter = 0;
+        currentSecond = Time.second();
+        clockAnimationActive = true;
+        clockShown = false;
+        closeMyFile();
+        abortImage = true;
       }
-      nextImage();
-      drawFrame();
     }
-    else if (displayMode == 1)
+    else
     {
-      alertPhase = 1;
-      offsetX = 0;
-      offsetY = 0;
-      secondCounter = 0;
-      currentSecond = Time.second();
-      clockAnimationActive = true;
-      clockShown = false;
-      closeMyFile();
-      abortImage = true;
+      Serial.println("Alert folder not found.");
+      nextFolder[0] = '\0';
     }
   }
   else
@@ -5744,37 +6013,39 @@ int cloudColor(String c)
   {
     // verify chaining folders disabled
     chainIndex = -1;
+    byte r, g, b;
 
-    // Get rid of '#' and convert it to integer
-    int number = 0;
-    if (c[0] == '#') number = (int) strtol( &c[1], NULL, 16);
-    else number = (int) strtol( &c[0], NULL, 16);
+    if (isDigit(c[0]) || c[0] == '#')
+    {
+      // Get rid of '#' and convert it to integer
+      int number = 0;
+      if (c[0] == '#') number = (int) strtol( &c[1], NULL, 16);
+      else number = (int) strtol( &c[0], NULL, 16);
 
-    // Split them up into r, g, b values
-    int r = number >> 16;
-    int g = number >> 8 & 0xFF;
-    int b = number & 0xFF;
+      // Split them up into r, g, b values
+      r = number >> 16;
+      g = number >> 8 & 0xFF;
+      b = number & 0xFF;
+    }
 
     // random color
-    if (c[0] == 'r' || c[0] == 'R')
+    else if (c.toLowerCase() == "random")
     {
       r = random8();
       g = random8();
       b = random8();
-
-      // apply contrast
-      r = dim8_jer(r);
-      g = dim8_jer(g);
-      b = dim8_jer(b);
     }
 
     // off; eventually want to make this return to previous animation
-    else if (c[0] == 'o' || c[0] == 'O')
+    else if (c.toLowerCase() == "off")
     {
       r = 0;
       g = 0;
       b = 0;
     }
+
+    // convert color text to RGB values
+    else colorNameToRGB(c, &r, &g, &b);
 
     if (displayMode == 0)
     {
@@ -5790,11 +6061,39 @@ int cloudColor(String c)
     }
     holdTime = -1;
     secondCounter = 0;
-    for (int i = 0; i < 256; i++)
+
+    // apply contrast
+    r = dim8_jer(r);
+    g = dim8_jer(g);
+    b = dim8_jer(b);
+
+    // rainbow unicorns exist
+    if (c.toLowerCase() == "rainbow")
     {
-      leds[i] = CRGB(r, g, b);
+      uint8_t rainbowPixel = 0;
+      uint8_t rainbowHue = 0;
+      // each row
+      for (uint8_t r=0; r<16; r++)
+      {
+        // each column
+        for (uint8_t c=0; c<16; c++)
+        {
+          leds[rainbowPixel++] = CHSV(rainbowHue, 255, 255);
+        }
+        rainbowHue += 16;
+      }
+      FastLED.show();
     }
-    FastLED.show();
+
+    else
+    {
+      // send the color data
+      for (int i = 0; i < 256; i++)
+      {
+        leds[i] = CRGB(r, g, b);
+      }
+      FastLED.show();
+    }
   }
   else return 0;
 }
