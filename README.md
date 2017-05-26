@@ -1,7 +1,7 @@
 # GameFrameV2_WiFi
 Particle Photon firmware for Game Frame
 
-If you're here to get the latest firmware, you'll find it inside the /[compiled](https://github.com/Jerware/GameFrameV2_WiFi/tree/master/compiled) folder.
+If you're here for the latest firmware, you'll find it on the [Releases page](https://github.com/Jerware/GameFrameV2_WiFi/releases).
 
 The Wi-Fi adapter is available for purchase at [ledseq.com](http://www.ledseq.com). If you wish to assemble your own using a Particle Photon and some male headers, you can [order a blank PCB from Osh Park](https://oshpark.com/shared_projects/A1xRM1Wa). Just make sure to solder the male headers first, and then the Photon as illustrated in the photos on this repo.
 
