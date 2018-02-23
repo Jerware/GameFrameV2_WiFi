@@ -1,6 +1,6 @@
 /***************************************************
   Game Frame V3 Source Code
-  Jeremy Williams, 5-23-2017
+  Jeremy Williams, 2-16-2018
 
   NOTE: Altering your firmware voids your warranty. Have fun.
 
@@ -10,7 +10,7 @@
 
   In the SD card, place 24 bit color BMP files
 ****************************************************/
-#define firmwareVersion 20170523 // firmware version
+#define firmwareVersion 20180216 // firmware version
 
 #pragma SPARK_NO_PREPROCESSOR
 #include "SdFat.h"
@@ -26,10 +26,25 @@ FASTLED_USING_NAMESPACE;
 #include <math.h>
 #include "effects.h"
 #include "colorNameToRGB.h"
+#include "HttpClient.h"
 
 SYSTEM_THREAD(ENABLED);
 SYSTEM_MODE(SEMI_AUTOMATIC);
 //SerialLogHandler logHandler(LOG_LEVEL_ALL); // get WIFI debug prints
+
+// HTTP setup
+HttpClient http;
+
+// Headers currently need to be set at init, useful for API keys etc.
+http_header_t headers[] = {
+    //  { "Content-Type", "application/json" },
+    //  { "Accept" , "application/json" },
+    { "Accept" , "*/*"},
+    { NULL, NULL } // NOTE: Always terminate headers will NULL
+};
+
+http_request_t request;
+http_response_t response;
 
 // function prototypes required by disabling the spark preprocessor
 void setCycleTime();
@@ -132,6 +147,14 @@ int realRandom(int min, int max);
 void colorNameToRGB(String colorName, byte *r, byte *g, byte *b);
 void firmwareUpdate_handler(system_event_t event, int param, void* moredata);
 void clearEEPROM();
+void showCoindeskBTC();
+void drawChart(float arry[]);
+void getChart(char chartFunction[], char chartSymbol[], char chartInterval[]);
+void refreshChart();
+void refreshChartLatest();
+void fill_gradient(CRGB top, CRGB bottom);
+void fastledshow();
+void fadeControl();
 
 // Pick an SPI configuration.
 // See SPI configuration section below (comments are for photon).
@@ -200,8 +223,9 @@ boolean APANativeBrightness = false; // true = hardware, false = software
 #define NUM_LEDS 256
 #define LED_TYPE APA102
 #define COLOR_ORDER BGR
-APA102Controller_WithBrightness<DATA_PIN, CLOCK_PIN, COLOR_ORDER> ledController;
+APA102Controller_WithBrightness<DATA_PIN, CLOCK_PIN, COLOR_ORDER, DATA_RATE_MHZ(30)> ledController;
 CRGB leds[NUM_LEDS];
+CRGB leds_buf[NUM_LEDS];
 
 //Button setup
 #define buttonNextPin D5  // "Next" button SmartMatrix D2 -> D5
@@ -218,6 +242,7 @@ DateTime now;
 
 //Global variables
 boolean
+chartStock = false, // false = crypto, true = stock
 firmwareUpdateReady = false, // use to speedup firmware updates when using system thread
 wifiFolderFound = false, // found the /wifi folder on SD?
 enableWifi = false, // enable wifi?
@@ -259,6 +284,7 @@ galleryStateStored = false, // state stored?
 gameInitialized = false;
 
 uint8_t
+chartStyle = 1, // 0 = area, 1 = candles
 readPhase = 0, // debug info for reporting reading from SD
 alertPhase = 0, // 0 = inactive, 1 = running, 2 = ending
 cylonLastLED = 0,
@@ -266,7 +292,7 @@ cylonHUE = 0, // I'm alive indicator during web server
 cylonSineValue = 0,
 abcMinute, // last minute ABC was checked
 playMode = 0, // 0 = sequential, 1 = random, 2 = pause animations
-displayMode = 0, // 0 = slideshow, 1 = clock, 2 = fx
+displayMode = 0, // 0 = slideshow, 1 = clock, 2 = fx, 3 = chart
 displayModeMax = 1, // max display mode
 brightness = 4, // LED brightness
 brightnessMultiplier = 8, // DO NOT CHANGE THIS!
@@ -289,9 +315,12 @@ int16_t
 folderIndex = 0; // current folder
 
 int
+fadeLengthGlobal = 0, // global value
+fadeLength = 0, // length in ms for fade up effect
 currentEffect = 0, // current effect (plasma, etc.)
 secondCounter = 0, // counts up every second
 secondCounterBuffer = 0, // buffered when entering alert
+chartRefresh = 0, // # of seconds to refresh chart
 fileIndex = 0, // current frame
 fileIndexBuffer = 0, // store index during alerts
 chainIndex = -1, // for chaining multiple folders
@@ -311,9 +340,12 @@ imageWidthBuffer = 0,
 imageHeightBuffer = 0,
 ballAngle;
 
-float timeZone = -7.0f;
+float
+timeZone = -7.0f,
+chartValues[18] = {0}; // arrray to store stock/coin values
 
 unsigned long
+fadeStartTime = 0, // millis to end fade
 prevRemoteMillis = 0, // last time a valid remote code was received
 lastRTCCheck = 0, // last DS3231 RTC check timestamp
 currentFilePosition = 0, // stores current position when using web server
@@ -340,7 +372,8 @@ uploadTargetFolder[32], // temp
 clockFace[25], // clock face
 chainRootFolder[9], // chain game
 nextFolder[32], // dictated next animation
-currentDirectory[32]; // store active folder when accessing web server
+currentDirectory[32], // store active folder when accessing web server
+chartSymbol[10] = "BTC"; // stock/coin
 
 CRGB secondHandColor = 0; // color grabbed from digits.bmp for second hand
 
@@ -382,6 +415,9 @@ EEPROM MAP
 134 = netmask
 138 = gateway
 142 = dns
+146 = chartStyle (not stored)
+147 = chartStock (boolean)
+148 = chartSymbol (10 bytes)
 201 = power state (128 = off, 255 = on)
 */
 
@@ -440,7 +476,7 @@ void setup(void) {
   FastLED.addLeds((CLEDController*) &ledController, leds, NUM_LEDS).setDither(0);
   stripSetBrightness();
   clearStripBuffer();
-  FastLED.show();
+  fastledshow();
 
   // run burn in test if both tactile buttons held on cold boot
   if ((digitalRead(buttonNextPin) == LOW) && (digitalRead(buttonMenuPin) == LOW))
@@ -520,6 +556,12 @@ void setup(void) {
     displayModeMax = 2;
   }
 
+  // enable chart?
+  if (sd.exists("/00system/mode_3.bmp"))
+  {
+    displayModeMax = 3;
+  }
+
   // force download new files
   boolean forceDownload = true;
   if (Particle.connected() && forceDownload)
@@ -528,7 +570,7 @@ void setup(void) {
     {
       // draw WIFI
       bmpDraw("/00system/wifi/wifi.bmp", 0, 0);
-      FastLED.show();
+      fastledshow();
 
       Serial.println("Starting FTP...");
       sd.chdir("/00system");
@@ -541,6 +583,29 @@ void setup(void) {
         displayModeMax = 2;
         Serial.print(ftpFileName);
         Serial.println(" installed.");
+      }
+      sd.chdir("/");
+    }
+
+    // charts
+    if (!sd.exists("/00system/mode_3.bmp"))
+    {
+      // draw WIFI
+      bmpDraw("/00system/wifi/wifi.bmp", 0, 0);
+      fastledshow();
+
+      Serial.println("Starting FTP...");
+      sd.chdir("/00system");
+      strcpy (ftpFileName, "mode_3.bmp");
+      if(doFTP("download")) Serial.println("FTP OK");
+      else Serial.println("FTP FAIL");
+
+      if (sd.exists("/00system/mode_3.bmp"))
+      {
+        displayModeMax = 3;
+        Serial.print(ftpFileName);
+        Serial.println(" installed.");
+        downloadIndex();
       }
       sd.chdir("/");
     }
@@ -575,6 +640,14 @@ void setup(void) {
   output = EEPROM.read(5);
   if (output >= 1 && output <= 5) setClockFace(output);
   else setClockFace(1);
+
+  char eeSymbol[10];
+  EEPROM.get(148, eeSymbol);
+  if (isDigit(eeSymbol[0]) || isAlpha(eeSymbol[0])) // seems legit
+  {
+    strcpy(chartSymbol, eeSymbol);
+    EEPROM.get(147, chartStock);
+  }
 
   // load IR codes
   readRemoteIni();
@@ -615,6 +688,7 @@ void initGameFrame()
   // reset vars
   currentEffect = 0;
   secondCounter = 0;
+  chartRefresh = 0;
   menuMode = 0;
   displayFolderCount = false;
   webServerActive = false;
@@ -651,7 +725,7 @@ void initGameFrame()
         if (displayFolderCount == true)
         {
           leds[numFolders] = CRGB(128, 255, 0);
-          FastLED.show();
+          fastledshow();
         }
         numFolders++;
         Serial.print(F("File Index: "));
@@ -741,7 +815,7 @@ void stripSetBrightness()
   if (brightness == 0)
   {
     clearStripBuffer();
-    FastLED.show();
+    fastledshow();
   }
 }
 
@@ -749,7 +823,7 @@ void remoteTest()
 {
   alertPhase = 1; // disable alerts
   clearStripBuffer();
-  FastLED.show();
+  fastledshow();
   sd.chdir("/00system");
   int graphicShown = 0;
   bmpDraw("irZapr.bmp", 0, 0);
@@ -829,7 +903,7 @@ void drawBox(uint8_t r, uint8_t g, uint8_t b)
   {
     leds[getIndex(0, i)] = CRGB(r, g, b);
   }
-  FastLED.show();
+  fastledshow();
 }
 
 void recordIRCodes()
@@ -922,7 +996,7 @@ void testScreen()
   {
     leds[i] = CRGB(255, 255, 255);
   }
-  FastLED.show();
+  fastledshow();
   delay(5000);
 
   // red
@@ -930,7 +1004,7 @@ void testScreen()
   {
     leds[i] = CRGB(255, 0, 0);
   }
-  FastLED.show();
+  fastledshow();
   delay(1000);
 
   // green
@@ -938,7 +1012,7 @@ void testScreen()
   {
     leds[i] = CRGB(0, 255, 0);
   }
-  FastLED.show();
+  fastledshow();
   delay(1000);
 
   // blue
@@ -946,7 +1020,7 @@ void testScreen()
   {
     leds[i] = CRGB(0, 0, 255);
   }
-  FastLED.show();
+  fastledshow();
   delay(1000);
 }
 
@@ -990,20 +1064,18 @@ void sdErrorMessage(uint8_t r, uint8_t g, uint8_t b)
   yellowDot(9, 9);
 
   stripSetBrightness();
-  FastLED.show();
+  fastledshow();
 
   while (true)
   {
     for (int i = 255; i >= 0; i--)
     {
       analogWrite(STATUS_LED, i);
-      printRemoteCode();
       delay(1);
     }
     for (int i = 0; i <= 254; i++)
     {
       analogWrite(STATUS_LED, i);
-      printRemoteCode();
       delay(1);
     }
 
@@ -1142,7 +1214,7 @@ void powerControl()
     singleGraphic = false;
     Serial.println("Firmware update!");
     bmpDraw("/00system/wifi/wifi.bmp", 0, 0);
-    FastLED.show();
+    fastledshow();
     while(firmwareUpdateReady)
     {
       // update and chill
@@ -1206,7 +1278,7 @@ void framePowerDown()
   }
   EEPROM.update(201, 128); // store power down state
   clearStripBuffer();
-  FastLED.show();
+  fastledshow();
 }
 
 void loop() {
@@ -1244,6 +1316,7 @@ void loop() {
             drawFrame();
           }
           else if (displayMode == 1) initClock();
+          else if (displayMode == 3) drawChart(chartValues);
         }
       }
     }
@@ -1283,6 +1356,12 @@ void mainLoop()
       {
         nextEffect();
         return;
+      }
+      else if (displayMode == 3)
+      {
+        chartStyle++;
+        if (chartStyle > 1) chartStyle = 0;
+        drawChart(chartValues);
       }
     }
     else
@@ -1375,7 +1454,7 @@ void mainLoop()
         leds[paddleIndex] = CRGB(200, 200, 200);
         leds[paddleIndex + 1] = CRGB(200, 200, 200);
         leds[paddleIndex + 2] = CRGB(200, 200, 200);
-        FastLED.show();
+        fastledshow();
         return;
       }
     }
@@ -1402,7 +1481,7 @@ void mainLoop()
   // menu button
   else if ((digitalRead(buttonMenuPin) == LOW || irCommand == 'M') && buttonPressed == false && buttonEnabled == true)
   {
-    if (displayMode > displayModeMax) displayMode = 0; // make sure the user has proper menu graphics installed
+    fadeStartTime = 0; // cancel any pending fades
     buttonPressed = true;
     menuEndTime = millis() + 3000;
     menuPowerCounter = millis() + 1500;
@@ -1461,6 +1540,7 @@ void mainLoop()
     }
     else if (menuMode == 3)
     {
+      if (displayMode > displayModeMax) displayMode = 0; // make sure the user has proper menu graphics installed
       char modeChar[2];
       char modeFile[21];
       strcpy_P(modeFile, PSTR("/00system/mode_"));
@@ -1509,6 +1589,11 @@ void mainLoop()
         drawFrame();
       }
       else clearStripBuffer();
+      if (displayMode == 3)
+      {
+        drawChart(chartValues);
+        refreshChart();
+      }
     }
   }
 
@@ -1517,6 +1602,7 @@ void mainLoop()
   {
     if (clockShown == false || clockAnimationActive == true)
     {
+      fadeControl();
       // advance counter
       if (currentSecond != lastSecond)
       {
@@ -1554,6 +1640,12 @@ void mainLoop()
           {
             nextEffect();
           }
+          else if (displayMode == 3 && alertPhase == 0)
+          {
+            secondCounter = 0;
+            chartRefresh = 60;
+            refreshChart(); // refresh whole chart
+          }
           else
           {
             // stop folder chain if necessary
@@ -1565,13 +1657,41 @@ void mainLoop()
         }
       }
 
-      if (displayMode == 2 && alertPhase == 0 && logoPlayed == true) // effects mode
+      if (alertPhase == 0 && logoPlayed == true && displayMode >=2)
       {
-        runEffects();
+        // effects mode
+        if (displayMode == 2)
+        {
+          runEffects();
+        }
+        // display chart
+        else if (displayMode == 3)
+        {
+          if (secondCounter > chartRefresh)
+          {
+            // force hourly chart update
+            if (secondCounter > 3600 || chartValues[0] == 0.0f)
+            {
+              secondCounter = 0;
+              chartRefresh = 60;
+              refreshChart();
+            }
+            else
+            {
+              chartRefresh = secondCounter + 60;
+              // Refresh right-most column every minute
+              if (cycleTimeSetting >= 4)
+              {
+                refreshChartLatest();
+                drawChart(chartValues);
+              }
+            }
+          }
+        }
       }
 
       // animate if not a single-frame & animations are on; always animate the logo
-      else if (holdTime != -1 && playMode != 2 || logoPlayed == false)
+      else if (holdTime != -1 && playMode != 2 && playMode != 3 || logoPlayed == false)
       {
         if (millis() >= swapTime && clockShown == false)
         {
@@ -1661,6 +1781,7 @@ void nextImage()
     // reset secondCounter if not playing clock animations
     if (!clockAnimationActive) secondCounter = 0;
     baseTime = millis();
+    fadeStartTime = millis();
     holdTime = 0;
     sd.chdir("/");
     fileIndex = 0;
@@ -1966,55 +2087,56 @@ void drawFrame()
     }
   }
 
-  char bmpFile[13]; // 8-digit number + .bmp + null byte
-  itoa(fileIndex, bmpFile, 10);
-  strcat(bmpFile, ".bmp");
-  if (!sd.exists(bmpFile))
+  if (singleGraphic == false)
   {
-    /*Serial.println("~~~~");
-    char volumeWorkingDirectory[32];
-    sd.vwd()->getName(volumeWorkingDirectory, 31);
-    Serial.print("dir == ");
-    Serial.println(volumeWorkingDirectory);
-    Serial.print("bmpFile == ");
-    Serial.println(bmpFile);
-    Serial.print("singleGraphic == ");
-    Serial.println(singleGraphic);
-    Serial.print("folderLoop == ");
-    Serial.println(folderLoop);
-    Serial.print("timerLapsed == ");
-    Serial.println(timerLapsed);*/
-    fileIndex = 0;
+    char bmpFile[13]; // 8-digit number + .bmp + null byte
     itoa(fileIndex, bmpFile, 10);
     strcat(bmpFile, ".bmp");
-    if (finishBeforeProgressing && (offsetSpeedX != 0 || offsetSpeedY != 0)); // translating image - continue animating until moved off screen
-    else if (folderLoop == false || timerLapsed == true)
+    if (!sd.exists(bmpFile))
     {
-      if (displayMode == 0 || displayMode == 2)
+      /*Serial.println("~~~~");
+      char volumeWorkingDirectory[32];
+      sd.vwd()->getName(volumeWorkingDirectory, 31);
+      Serial.print("dir == ");
+      Serial.println(volumeWorkingDirectory);
+      Serial.print("bmpFile == ");
+      Serial.println(bmpFile);
+      Serial.print("singleGraphic == ");
+      Serial.println(singleGraphic);
+      Serial.print("folderLoop == ");
+      Serial.println(folderLoop);
+      Serial.print("timerLapsed == ");
+      Serial.println(timerLapsed);*/
+      fileIndex = 0;
+      itoa(fileIndex, bmpFile, 10);
+      strcat(bmpFile, ".bmp");
+      if (finishBeforeProgressing && (offsetSpeedX != 0 || offsetSpeedY != 0)); // translating image - continue animating until moved off screen
+      else if (folderLoop == false || timerLapsed == true)
       {
-        Serial.println("No more images to display and folderLoop == false.");
-        if (alertPhase > 0)
+        if (displayMode == 0 || displayMode == 2 || displayMode == 3)
         {
+          Serial.println("No more images to display and folderLoop == false.");
+          if (displayMode == 3) drawChart(chartValues);
           nextImage();
           return;
         }
-        else nextImage();
-      }
-      else if (displayMode == 1)
-      {
-        Serial.println(F("Animation finished. Initializing clock."));
-        initClock();
-        return;
+        else if (displayMode == 1)
+        {
+          Serial.println(F("Animation finished. Initializing clock."));
+          initClock();
+          return;
+        }
       }
     }
+    bmpDraw(bmpFile, 0, 0);
   }
-  bmpDraw(bmpFile, 0, 0);
+  else bmpDraw("0.bmp", 0, 0);
 
-  // print draw time in milliseconds
-  drawTime = millis() - lastTime;
-  lastTime = millis();
   if (debugMode)
   {
+    // print draw time in milliseconds
+    drawTime = millis() - lastTime;
+    lastTime = millis();
     Serial.print(F("ttd: "));
     Serial.println(drawTime);
   }
@@ -2234,7 +2356,7 @@ void bmpDraw(char *filename, int x, int y) {
   }
   if (!clockShown || breakout == true)
   {
-    FastLED.show();
+    fastledshow();
   }
   if (singleGraphic == false || menuActive == true || breakout == true)
   {
@@ -2318,7 +2440,7 @@ void runABC()
           if (brightness == 0)
           {
             clearStripBuffer();
-            FastLED.show();
+            fastledshow();
           }
           else if (displayMode == 1)
           {
@@ -2383,7 +2505,7 @@ void initClock()
     if (hour12 && currentHour > 12) currentHour -= 12;
     if (hour12 && currentHour == 0) currentHour = 12;
     drawDigits();
-    FastLED.show();
+    fastledshow();
   }
 }
 
@@ -2420,7 +2542,7 @@ void setClockHour()
       lastButtonCheck = millis();
       lastDigitFlash = millis();
       drawDigits();
-      FastLED.show();
+      fastledshow();
       debugClockDisplay();
     }
 
@@ -2429,7 +2551,7 @@ void setClockHour()
     {
       lastDigitFlash = millis();
       drawDigits();
-      FastLED.show();
+      fastledshow();
       debugClockDisplay();
     }
 
@@ -2460,7 +2582,7 @@ void setClockMinute()
       lastButtonCheck = millis();
       lastDigitFlash = millis();
       drawDigits();
-      FastLED.show();
+      fastledshow();
       debugClockDisplay();
     }
 
@@ -2469,7 +2591,7 @@ void setClockMinute()
     {
       lastDigitFlash = millis();
       drawDigits();
-      FastLED.show();
+      fastledshow();
       debugClockDisplay();
     }
 
@@ -2503,7 +2625,7 @@ void syncClock(boolean force)
       lastSync = millis();
     }
   }
-  else
+  else if (enableWifi == false) // don't use DS3231 if Wi-Fi dropped. Causes issues. Instead wait for Wi-Fi to come back online.
   {
     if (millis() - lastSync > RTC_SYNC_TIME || force)
     {
@@ -2547,13 +2669,13 @@ void showClock()
       storeSecondHandColor();
       drawDigits();
       secondHand();
-      FastLED.show();
+      fastledshow();
     }
     // second hand disabled, so only draw time on new minute
     else if (currentSecond == 0)
     {
       drawDigits();
-      FastLED.show();
+      fastledshow();
     }
 
     // show an animation
@@ -2833,6 +2955,20 @@ bool readIniFile()
     finishBeforeProgressing = false;
   }
 
+  // fade in length in ms
+  strcpy_P(entry, PSTR("fadein"));
+
+  // Fetch a value from a key which is present
+  if (ini.getValue(section, entry, buffer, bufferLen)) {
+    Serial.print(F("fadein value: "));
+    Serial.println(buffer);
+    fadeLength = atoi(buffer);
+  }
+  else {
+    printErrorMessage(ini.getError());
+    fadeLength = fadeLengthGlobal;
+  }
+
   strcpy_P(section, PSTR("translate"));
   strcpy_P(entry, PSTR("moveX"));
 
@@ -3067,15 +3203,26 @@ void APANativeBrightnessCheck()
   else {
     printErrorMessage(ini.getError());
   }
+
+  // fade in length in ms
+  strcpy_P(entry, PSTR("fadein"));
+
+  // Fetch a value from a key which is present
+  if (ini.getValue(section, entry, buffer, bufferLen)) {
+    Serial.print(F("fadein value: "));
+    Serial.println(buffer);
+    fadeLengthGlobal = atoi(buffer);
+  }
+  else {
+    printErrorMessage(ini.getError());
+    fadeLengthGlobal = 0;
+  }
 }
 
 void clearEEPROM()
 {
   Serial.println("Clearing EEPROM...");
-  for (int i = 0 ; i < 201 ; i++)
-  {
-    EEPROM.update(i, 0);
-  }
+  EEPROM.clear();
   Serial.println("Done!");
 }
 
@@ -4040,7 +4187,7 @@ void drawPaddle()
   leds[paddleIndex] = CRGB(200, 200, 200);
   leds[paddleIndex + 1] = CRGB(200, 200, 200);
   leds[paddleIndex + 2] = CRGB(200, 200, 200);
-  FastLED.show();
+  fastledshow();
 }
 
 void breakoutLoop()
@@ -4124,7 +4271,7 @@ void breakoutLoop()
           }
           leds[i] = CRGB(r, g, b);
         }
-        FastLED.show();
+        fastledshow();
         delay(50);
       }
     }
@@ -4188,7 +4335,7 @@ void breakoutLoop()
           for (byte flashes=0; flashes < 30; flashes++)
           {
             leds[ballIndex] = CRGB(random8(), random8(), random8());
-            FastLED.show();
+            fastledshow();
             delay(50);
           }
           ballMoving = false;
@@ -4209,7 +4356,7 @@ void breakoutLoop()
       if (breakout == true)
       {
         leds[ballIndex] = CRGB(175, 255, 15);
-        FastLED.show();
+        fastledshow();
       }
     }
   }
@@ -4477,7 +4624,8 @@ void setCmd(WebServer &server, WebServer::ConnectionType type, char *url_tail, b
     brightness = atoi(&url_tail[1]);
     stripSetBrightness();
     saveSettingsToEEPROM();
-    FastLED.show();
+    if (displayMode == 3) drawChart(chartValues);
+    else fastledshow();
   }
 
   // playMode
@@ -4530,7 +4678,7 @@ void setCmd(WebServer &server, WebServer::ConnectionType type, char *url_tail, b
       if (clockShown && !enableSecondHand)
       {
         drawDigits();
-        FastLED.show();
+        fastledshow();
       }
     }
   }
@@ -4599,7 +4747,7 @@ void webServerCylon()
     }
     // cylonHUE += random(255); // enable for crazy colors
     leds[cylonLED].setHue(cylonHUE).fadeToBlackBy(128);
-    FastLED.show();
+    fastledshow();
     cylonTime = millis() + 10;
   }
 }
@@ -4628,27 +4776,27 @@ void commandCmd(WebServer &server, WebServer::ConnectionType type, char *url_tai
         /* this is a standard string comparison function.  It returns 0
          * when there's an exact match.  We're looking for a parameter
          * named "next" here. */
-        if (strcmp(name, "next") == 0)
+        if (strcasecmp(name, "next") == 0)
         {
           irCommand = 'N';
           server.httpNoContent();
         }
-        else if (strcmp(name, "menu") == 0)
+        else if (strcasecmp(name, "menu") == 0)
         {
           irCommand = 'M';
           server.httpNoContent();
         }
-        else if (strcmp(name, "power") == 0)
+        else if (strcasecmp(name, "power") == 0)
         {
           irCommand = 'P';
           server.httpNoContent();
         }
-        else if (strcmp(name, "brightness") == 0)
+        else if (strcasecmp(name, "brightness") == 0)
         {
           cloudBrightness(value);
         }
         // skip backward in nested movie
-        else if (strcmp(name, "chapter-") == 0)
+        else if (strcasecmp(name, "chapter-") == 0)
         {
           if (offsetSpeedY == 16)
           {
@@ -4659,7 +4807,7 @@ void commandCmd(WebServer &server, WebServer::ConnectionType type, char *url_tai
           server.httpNoContent();
         }
         // skip forward in nested movie
-        else if (strcmp(name, "chapter+") == 0)
+        else if (strcasecmp(name, "chapter+") == 0)
         {
           if (offsetSpeedY == 16)
           {
@@ -4668,13 +4816,13 @@ void commandCmd(WebServer &server, WebServer::ConnectionType type, char *url_tai
           server.httpNoContent();
         }
         // randomize plasma
-        else if (strcmp(name, "plasma_r") == 0)
+        else if (strcasecmp(name, "plasma_r") == 0)
         {
           randomizePlasma();
           server.httpNoContent();
         }
         // play an animation
-        else if (strcmp(name, "play") == 0)
+        else if (strcasecmp(name, "play") == 0)
         {
           char folderWithSlash[34];
           strcpy_P(folderWithSlash, PSTR("/"));
@@ -4698,7 +4846,7 @@ void commandCmd(WebServer &server, WebServer::ConnectionType type, char *url_tai
         }
 
         // make folder
-        else if (strcmp(name, "mkdir") == 0)
+        else if (strcasecmp(name, "mkdir") == 0)
         {
           storeGalleryState();
           strcpy(uploadTargetFolder, value);
@@ -4728,7 +4876,7 @@ void commandCmd(WebServer &server, WebServer::ConnectionType type, char *url_tai
         }
 
         // remove folder
-        else if (strcmp(name, "rmdir") == 0)
+        else if (strcasecmp(name, "rmdir") == 0)
         {
           storeGalleryState();
 
@@ -4751,15 +4899,34 @@ void commandCmd(WebServer &server, WebServer::ConnectionType type, char *url_tai
         }
 
         // change time zone
-        else if (strcmp(name, "timeZone") == 0)
+        else if (strcasecmp(name, "timeZone") == 0)
         {
           timeZone = atof(value);
           setTimeZone();
           saveTimeZone();
+          server.httpNoContent();
+        }
+
+        // stock chart
+        else if (strcasecmp(name, "chart") == 0)
+        {
+          char *c_type;
+          char *c_symbol;
+          c_type = strtok(value, ",");
+          c_symbol = strtok(NULL, " ");
+          strcpy(chartSymbol, c_symbol);
+          if (strcasecmp(c_type, "stock") == 0) chartStock = true;
+          else chartStock = false;
+          displayMode = 3;
+          chartRefresh = secondCounter + 60;
+          refreshChart();
+          EEPROM.put(147, chartStock);
+          EEPROM.put(148, chartSymbol);
+          server.httpNoContent();
         }
 
         // retrieve current settings as json
-        else if (strcmp(name, "getValues") == 0)
+          else if (strcasecmp(name, "getValues") == 0)
         {
           Serial.println("Sending current variable values.");
           server.httpSuccess("application/json");
@@ -5127,10 +5294,23 @@ void readHTML(WebServer &server, const String& htmlfile)
           {
             server.print(firmwareVersion);
           }
+          else if (command == "chart")
+          {
+            server.print(chartSymbol);
+          }
+          else if (command == "stockcoinsymbol")
+          {
+            server.print(chartSymbol);
+          }
+          else if (command == "stockcoin")
+          {
+            if (chartStock) server.print("stock");
+            else server.print("coin");
+          }
           else
           {
-            Serial.print("UNKNOWN COMMAND: ");
-            Serial.println(command);
+            Serial.print("UNKNOWN: ");
+            Serial.print(command);
           }
         }
       }
@@ -5429,7 +5609,7 @@ void storeGalleryState()
   if (framePowered && alertPhase == 0 && brightness > 0)
   {
     bmpDraw("/00system/wifi/wifi.bmp", 0, 0);
-    FastLED.show();
+    fastledshow();
     closeMyFile();
   }
 }
@@ -5456,6 +5636,19 @@ void resumeGalleryState()
     imageWidth = imageWidthBuffer;
     imageHeight = imageHeightBuffer;
     clearStripBuffer();
+    return;
+  }
+  else if (displayMode == 3)
+  {
+    Serial.println("Returning to Chart...");
+    galleryStateStored = false;
+    setCycleTime();
+    secondCounter = secondCounterBuffer;
+    offsetX = offsetBufferX;
+    offsetY = offsetBufferY;
+    imageWidth = imageWidthBuffer;
+    imageHeight = imageHeightBuffer;
+    drawChart(chartValues);
     return;
   }
   sd.chdir("/");
@@ -5555,7 +5748,7 @@ void webServerDisplayManager()
       leds[i] = CRGB(luma, luma, luma);
     }
     */
-    FastLED.show();
+    fastledshow();
   }
   // exit web priority
   else
@@ -5608,7 +5801,7 @@ void scrollAddress()
         }
         xDrawShift += 2; // leave space between octets
       }
-      FastLED.show();
+      fastledshow();
       scroll--; // scroll left
     }
   }
@@ -5634,37 +5827,37 @@ int cloudCommand(String c)
   Serial.print("Parameter: ");
   Serial.println(parameter);
 
-  if (strcmp(command, "next") == 0)
+  if (strcasecmp(command, "next") == 0)
   {
     cloudNext(parameter);
   }
-  else if (strcmp(command, "brightness") == 0 || strcmp(command, "b") == 0)
+  else if (strcasecmp(command, "brightness") == 0 || strcasecmp(command, "b") == 0)
   {
     cloudBrightness(parameter);
   }
-  else if (strcmp(command, "power") == 0)
+  else if (strcasecmp(command, "power") == 0)
   {
     cloudPower(parameter);
   }
-  else if (strcmp(command, "play") == 0)
+  else if (strcasecmp(command, "play") == 0)
   {
     cloudPlayFolder(parameter);
   }
-  else if (strcmp(command, "alert") == 0)
+  else if (strcasecmp(command, "alert") == 0)
   {
     cloudAlert(parameter);
   }
-  else if (strcmp(command, "color") == 0)
+  else if (strcasecmp(command, "color") == 0)
   {
     cloudColor(parameter);
   }
-  else if (strcmp(command, "webserver") == 0)
+  else if (strcasecmp(command, "webserver") == 0)
   {
     Serial.println("Relaunching web server.");
     webserver.begin(); // test for relaunching web server after Wi-Fi dropout
   }
   // change clock face
-  else if (strcmp(command, "clockface") == 0)
+  else if (strcasecmp(command, "clockface") == 0)
   {
     Serial.println("Changing clock face.");
     uint8_t face = atoi(parameter);
@@ -5672,11 +5865,11 @@ int cloudCommand(String c)
     if (clockShown && !enableSecondHand)
     {
       drawDigits();
-      FastLED.show();
+      fastledshow();
     }
   }
   // change time zone
-  else if (strcmp(command, "timezone") == 0)
+  else if (strcasecmp(command, "timezone") == 0)
   {
     Serial.println("Changing timezone.");
     timeZone = atof(parameter);
@@ -5684,13 +5877,13 @@ int cloudCommand(String c)
     saveTimeZone();
   }
   // plasma
-  else if (strcmp(command, "plasma") == 0)
+  else if (strcasecmp(command, "plasma") == 0)
   {
     Serial.println("Plasma.");
     displayMode = 2;
   }
   // change playback mode
-  else if (strcmp(command, "playback") == 0)
+  else if (strcasecmp(command, "playback") == 0)
   {
     Serial.println("Changing playback mode.");
     uint8_t newPlayback = playMode;
@@ -5700,8 +5893,8 @@ int cloudCommand(String c)
     // accept "on" or "off" text for Alexa compatibility. Controls shuffle mode.
     else
     {
-      if (strcmpi(parameter, "on") == 0) newPlayback = 1;
-      else if (strcmpi(parameter, "off") == 0) newPlayback = 0;
+      if (strcasecmp(parameter, "on") == 0) newPlayback = 1;
+      else if (strcasecmp(parameter, "off") == 0) newPlayback = 0;
     }
 
     if (newPlayback < 3)
@@ -5711,7 +5904,7 @@ int cloudCommand(String c)
     }
   }
   // change display mode
-  else if (strcmp(command, "display") == 0)
+  else if (strcasecmp(command, "display") == 0)
   {
     Serial.println("Display mode change requested.");
     uint8_t oldMode = displayMode;
@@ -5721,19 +5914,19 @@ int cloudCommand(String c)
     if (isDigit(parameter[0])) newMode = atoi(parameter);
 
     // text received, must convert
-    else if (strcmp(parameter, "gallery") == 0
-      || strcmp(parameter, "graphics") == 0
-      || strcmp(parameter, "pictures") == 0
-      || strcmp(parameter, "animation") == 0
-      || strcmp(parameter, "animations") ==0)
+    else if (strcasecmp(parameter, "gallery") == 0
+      || strcasecmp(parameter, "graphics") == 0
+      || strcasecmp(parameter, "pictures") == 0
+      || strcasecmp(parameter, "animation") == 0
+      || strcasecmp(parameter, "animations") ==0)
     {
       newMode = 0;
     }
-    else if (strcmp(parameter, "clock") == 0 || strcmp(parameter, "time") == 0)
+    else if (strcasecmp(parameter, "clock") == 0 || strcasecmp(parameter, "time") == 0)
     {
       newMode = 1;
     }
-    else if (strcmp(parameter, "effect") == 0 || strcmp(parameter, "effects") == 0)
+    else if (strcasecmp(parameter, "effect") == 0 || strcasecmp(parameter, "effects") == 0)
     {
       newMode = 2;
     }
@@ -5760,7 +5953,7 @@ int cloudCommand(String c)
     }
   }
   // change cycle time
-  else if (strcmp(command, "cycle") == 0)
+  else if (strcasecmp(command, "cycle") == 0)
   {
     Serial.println("Changing cycle interval.");
     uint8_t newSetting;
@@ -5770,16 +5963,16 @@ int cloudCommand(String c)
     // alexa compatibility
     else
     {
-      if (strcmpi(parameter, "PT10S") == 0) newSetting = 1;
-      else if (strcmpi(parameter, "PT30S") == 0) newSetting = 2;
-      else if (strcmpi(parameter, "PT1M") == 0) newSetting = 3;
-      else if (strcmpi(parameter, "PT5M") == 0) newSetting = 4;
-      else if (strcmpi(parameter, "PT15M") == 0) newSetting = 5;
-      else if (strcmpi(parameter, "PT30M") == 0) newSetting = 6;
-      else if (strcmpi(parameter, "PT1H") == 0) newSetting = 7;
+      if (strcasecmp(parameter, "PT10S") == 0) newSetting = 1;
+      else if (strcasecmp(parameter, "PT30S") == 0) newSetting = 2;
+      else if (strcasecmp(parameter, "PT1M") == 0) newSetting = 3;
+      else if (strcasecmp(parameter, "PT5M") == 0) newSetting = 4;
+      else if (strcasecmp(parameter, "PT15M") == 0) newSetting = 5;
+      else if (strcasecmp(parameter, "PT30M") == 0) newSetting = 6;
+      else if (strcasecmp(parameter, "PT1H") == 0) newSetting = 7;
       // workaround for AMAZON.DURATION not supporting infinity (use 1 year instead)
-      else if (strcmpi(parameter, "P1Y") == 0) newSetting = 8;
-      else if (strcmpi(parameter, "infinity") == 0) newSetting = 8;
+      else if (strcasecmp(parameter, "P1Y") == 0) newSetting = 8;
+      else if (strcasecmp(parameter, "infinity") == 0) newSetting = 8;
     }
 
     if (newSetting <= 8 && newSetting > 0)
@@ -5790,11 +5983,57 @@ int cloudCommand(String c)
     }
   }
   // reboot
-  else if (strcmp(command, "reboot") == 0)
+  else if (strcasecmp(command, "reboot") == 0)
   {
     Serial.println("Rebooting.");
     systemRecover();
   }
+  // choose effect
+  else if (strcasecmp(command, "effect") == 0)
+  {
+    Serial.println("Changing effect.");
+    int requestedEffect = atoi(parameter);
+    // valid effect?
+    if (requestedEffect >= 0 && requestedEffect < numEffects)
+    {
+      currentEffect = requestedEffect;
+      if (displayMode == 2)
+      {
+        clearStripBuffer();
+        BasicVariablesSetup();
+        secondCounter = 0;
+        baseTime = millis();
+      }
+    }
+  }
+
+  // stock chart
+  // example: Command stock AAPL
+  else if (strcasecmp(command, "stock") == 0)
+  {
+    chartStock = true;
+    displayMode = 3;
+    chartRefresh = secondCounter + 60;
+    strcpy(chartSymbol, parameter);
+    EEPROM.put(147, chartStock);
+    EEPROM.put(148, chartSymbol);
+    refreshChart();
+  }
+
+  // crypto chart
+  // example: Command coin BTC
+  else if (strcasecmp(command, "coin") == 0)
+  {
+    chartStock = false;
+    displayMode = 3;
+    chartRefresh = secondCounter + 60;
+    strcpy(chartSymbol, parameter);
+    EEPROM.put(147, chartStock);
+    EEPROM.put(148, chartSymbol);
+    refreshChart();
+  }
+
+  return 0;
 }
 
 int cloudNext(String c)
@@ -5848,7 +6087,7 @@ int cloudBrightness(String c)
       }
     }
     // Do NOT use this.
-    else if (strchr(c, '!'))
+    /*else if (strchr(c, '!'))
     {
       Serial.println("Absolute detected.");
       char absoluteString[5];
@@ -5863,14 +6102,15 @@ int cloudBrightness(String c)
       {
         FastLED.setBrightness(newBright);
       }
-    }
+    }*/
     else
     {
       brightness = atoi(c);
       stripSetBrightness();
       saveSettingsToEEPROM();
     }
-    FastLED.show();
+    if (displayMode == 3) drawChart(chartValues);
+    else fastledshow();
   }
   else return -1;
 }
@@ -5956,10 +6196,10 @@ int cloudAlert(String c)
       {
         leds[i] = CRGB(255, 255, 0);
       }
-      FastLED.show();
+      fastledshow();
       delay(50);
       clearStripBuffer();
-      FastLED.show();
+      fastledshow();
       delay(75);
     }
 
@@ -5967,7 +6207,7 @@ int cloudAlert(String c)
 
     if (sd.exists(nextFolder))
     {
-      if (displayMode == 0 || displayMode == 2)
+      if (displayMode == 0 || displayMode == 2 || displayMode == 3)
       {
         // only store gallery state once in case of multiple alerts
         if (alertPhase == 0 || alertPhase == 2)
@@ -6082,7 +6322,7 @@ int cloudColor(String c)
         }
         rainbowHue += 16;
       }
-      FastLED.show();
+      fastledshow();
     }
 
     else
@@ -6092,7 +6332,7 @@ int cloudColor(String c)
       {
         leds[i] = CRGB(r, g, b);
       }
-      FastLED.show();
+      fastledshow();
     }
   }
   else return 0;
@@ -6346,4 +6586,383 @@ void efail()
   Serial.println("Command disconnected");
   fh.close();
   Serial.println("SD closed");
+}
+
+void showCoindeskBTC()
+{
+  Serial.println("#HODL");
+  float bitcoin[16];
+
+  // historical data
+  // Request path and body can be set at runtime or at setup.
+  request.hostname = "api.coindesk.com";
+  request.port = 80;
+  request.path = "/v1/bpi/historical/close.json";
+
+  // Get request
+  http.get(request, response, headers);
+
+  char json[2048];
+  String jsonString = String(response.body);
+  strcpy(json, jsonString);
+  strtok(json, ":,}");
+  // skip to the last 15 weeks
+  for (int i=0; i<33; i++)
+  {
+    strtok(NULL, ":,}");
+  }
+  for (int i=0; i<15; i++)
+  {
+    bitcoin[i]=atoi(strtok(NULL, ":,}"));
+    strtok(NULL, ":,}");
+  }
+
+  // current price
+  request.path = "/v1/bpi/currentprice/USD.json";
+
+  // Get request
+  http.get(request, response, headers);
+
+  jsonString = String(response.body);
+  strcpy(json, jsonString);
+
+  strtok(json, ":}");
+  // skip to the goods
+  for (int i=0; i<17; i++)
+  {
+    strtok(NULL, ":}");
+  }
+  bitcoin[15]=atoi(strtok(NULL, ":}"));
+
+  /*// check your answers
+  Serial.println("---");
+  for (int i=0; i<16; i++)
+  {
+    Serial.print(bitcoin[i]);
+    Serial.print(", ");
+  }
+  Serial.println("---");*/
+
+  drawChart(bitcoin);
+}
+
+void getChart(char chartFunction[], char chartSymbol[], char chartInterval[])
+{
+  Serial.print("Get Chart: ");
+  Serial.print(chartFunction);
+  Serial.print(", ");
+  Serial.print(chartSymbol);
+  Serial.print(", ");
+  Serial.println(chartInterval);
+  chartValues[0] = '\0';
+
+  chartSymbol = strupr(chartSymbol);
+
+  // Request path and body can be set at runtime or at setup.
+  request.hostname = "ledseq.com";
+  request.port = 80;
+  // assemble path
+  char requestPath[120];
+  strcpy(requestPath, "/gf-stocks.php?chartFunction=");
+  strcat(requestPath, chartFunction);
+  strcat(requestPath, "&chartSymbol=");
+  strcat(requestPath, chartSymbol);
+  strcat(requestPath, "&chartInterval=");
+  strcat(requestPath, chartInterval);
+  request.path = requestPath;
+
+  // Get request
+  http.get(request, response, headers);
+
+  char json[2048];
+  String jsonString = String(response.body);
+  strcpy(json, jsonString);
+
+  // make backup
+  String dailyStringBackup = jsonString;
+
+  // error detection
+  if (jsonString.startsWith("ERROR"))
+  {
+    flashBox(255, 0, 0);
+    Serial.println(response.body);
+  }
+
+  // intraday
+  else if (strcmp(chartFunction, "TIME_SERIES_INTRADAY") == 0 || strcmp(chartFunction, "DIGITAL_CURRENCY_INTRADAY") == 0)
+  {
+    Serial.println("Intraday Chart");
+    chartValues[0]=atof(strtok(json, ","));
+    for (int i=1; i<17; i++)
+    {
+      chartValues[i]=atof(strtok(NULL, ","));
+    }
+  }
+
+  // daily
+  else
+  {
+    Serial.println("Daily Chart");
+    Serial.println(requestPath);
+    Serial.println(response.body);
+    chartValues[1]=atof(strtok(json, ","));
+    for (int i=2; i<17; i++)
+    {
+      chartValues[i]=atof(strtok(NULL, ","));
+    }
+
+    Serial.print("Append Latest?...");
+    // stock daily append current
+    if (strcmp(chartFunction, "TIME_SERIES_DAILY") == 0)
+    {
+      Serial.println("Stock Daily");
+      strcpy(requestPath, "/gf-stocks.php?chartFunction=TIME_SERIES_INTRADAY&chartInterval=1&chartSymbol=");
+      strcat(requestPath, chartSymbol);
+      request.path = requestPath;
+
+      // Get request
+      http.get(request, response, headers);
+
+      Serial.println(requestPath);
+      Serial.println(response.body);
+
+      char jsonIntraday[2048];
+      jsonString = String(response.body);
+      strcpy(jsonIntraday, jsonString);
+
+      chartValues[0]=atof(strtok(jsonIntraday, ","));
+
+      // trading day over?
+      if (chartValues[0] == chartValues[1])
+      {
+        // latest value already reflected in Daily data
+        Serial.println("Trading day over.");
+        strcpy(json, dailyStringBackup);
+        chartValues[0]=atof(strtok(json, ","));
+        for (int i=1; i<17; i++)
+        {
+          chartValues[i]=atof(strtok(NULL, ","));
+        }
+      }
+    }
+
+    // crypto daily append current
+    else if (strcmp(chartFunction, "DIGITAL_CURRENCY_DAILY") == 0)
+    {
+      Serial.println("Crypto Daily");
+      strcpy(requestPath, "/gf-stocks.php?chartFunction=DIGITAL_CURRENCY_PRICE&chartSymbol=");
+      strcat(requestPath, chartSymbol);
+      request.path = requestPath;
+
+      // Get request
+      http.get(request, response, headers);
+
+      char jsonIntraday[2048];
+      jsonString = String(response.body);
+      strcpy(jsonIntraday, jsonString);
+
+      chartValues[0]=atof(jsonIntraday);
+    }
+  }
+
+  // check your answers
+  Serial.println("---");
+  for (int i=0; i<17; i++)
+  {
+    Serial.print(chartValues[i]);
+    Serial.print(", ");
+  }
+  Serial.println("");
+  Serial.println("---");
+
+  drawChart(chartValues);
+}
+
+void drawChart(float arry[])
+{
+  // expects a 17-float array
+  // array should be in reverse chronological order
+  // i.e. first entry will render on the right-most column
+
+  float arrayMin = 2147483647;
+  float arrayMax = 0;
+
+  for (int i=0; i<16; i++)
+  {
+    arrayMin = min(arrayMin, arry[i]);
+  }
+  for (int i=0; i<16; i++)
+  {
+    arrayMax = max(arrayMax, arry[i]);
+  }
+
+  clearStripBuffer();
+
+  // area render
+  if (chartStyle == 0)
+  {
+    // just use the first 16 entries
+    for (int i=0; i<16; i++)
+    {
+      // map $USD to 0-15 (screen height)
+      uint8_t y = map(arry[i], arrayMin, arrayMax, 0.0f, 15.0f);
+      // color the peaks
+      leds[getIndex(15-i, 15-y)] = CRGB(255, 215, 0);
+      // fill beneath
+      for (int fill=y-1; fill>=0; --fill)
+      {
+        leds[getIndex(15-i, 15-fill)] = CRGB(32, 48, 32);
+      }
+    }
+    fastledshow();
+  }
+
+  // candle stick render (no wicks!)
+  else if (chartStyle == 1)
+  {
+    if (APANativeBrightness) fill_gradient(CRGB(0,0,8), CRGB(0,0,64));
+    else fill_gradient(CRGB(0,0,32), CRGB(0,0,64));
+    // 17th entry is used to color first candlestick
+    for (int i=0; i<16; i++)
+    {
+      // map $USD to 0-15 (screen height)
+      uint8_t y = map(arry[i], arrayMin, arrayMax, 0.0f, 15.0f);
+      uint8_t pY = map(arry[i+1], arrayMin, arrayMax, 0.0f, 15.0f); // previous column
+      // avoid draw errors for first column
+      if (arry[16] > arrayMax) arry[16] = arrayMax;
+      else if (arry[16] < arrayMin) arry[16] = arrayMin;
+      // bull
+      if (arry[i] >= arry[i+1])
+      {
+         for (int candle = pY; candle <= y; candle++)
+         {
+           leds[getIndex(15-i, 15-candle)] = CRGB(0, 255, 0);
+         }
+      }
+      // bear
+      else
+      {
+        for (int candle = pY; candle >= y; candle--)
+        {
+          leds[getIndex(15-i, 15-candle)] = CRGB(255, 0, 0);
+        }
+      }
+    }
+    fastledshow();
+  }
+}
+
+void refreshChart()
+{
+  char chartFunction[26];
+  // daily or intraday chart?
+  if (cycleTimeSetting == 8)
+  {
+    if (chartStock) strcpy(chartFunction, "TIME_SERIES_DAILY");
+    else strcpy(chartFunction, "DIGITAL_CURRENCY_DAILY");
+  }
+  else
+  {
+    if (chartStock) strcpy(chartFunction, "TIME_SERIES_INTRADAY");
+    else strcpy(chartFunction, "DIGITAL_CURRENCY_INTRADAY"); // DIGITAL_CURRENCY_INTRADAY
+  }
+
+  char timeInterval[3];
+  if (cycleTimeSetting <= 3) strcpy(timeInterval, "1");
+  else if (cycleTimeSetting == 4) strcpy(timeInterval, "5");
+  else if (cycleTimeSetting == 5) strcpy(timeInterval, "15");
+  else if (cycleTimeSetting == 6) strcpy(timeInterval, "30");
+  else strcpy(timeInterval, "60");
+  getChart(chartFunction, chartSymbol, timeInterval);
+}
+
+void refreshChartLatest()
+{
+  // Request path and body can be set at runtime or at setup.
+  char requestPath[120];
+  String jsonString;
+  Serial.print("Latest ");
+  Serial.print(chartSymbol);
+  Serial.print(" Price: ");
+
+  // stock
+  if (chartStock)
+  {
+    strcpy(requestPath, "/gf-stocks.php?chartFunction=TIME_SERIES_INTRADAY&chartInterval=1&chartSymbol=");
+    strcat(requestPath, chartSymbol);
+    request.path = requestPath;
+
+    // Get request
+    http.get(request, response, headers);
+
+    char jsonIntraday[2048];
+    jsonString = String(response.body);
+    strcpy(jsonIntraday, jsonString);
+
+    chartValues[0]=atof(strtok(jsonIntraday, ","));
+  }
+
+  // crypto
+  else
+  {
+    strcpy(requestPath, "/gf-stocks.php?chartFunction=DIGITAL_CURRENCY_PRICE&chartSymbol=");
+    strcat(requestPath, chartSymbol);
+    request.path = requestPath;
+
+    // Get request
+    http.get(request, response, headers);
+
+    char jsonIntraday[2048];
+    jsonString = String(response.body);
+    strcpy(jsonIntraday, jsonString);
+
+    chartValues[0]=atof(jsonIntraday);
+  }
+
+  Serial.print(chartValues[0]);
+  Serial.print(" ");
+  Serial.println(Time.timeStr());
+}
+
+void fill_gradient(CRGB top, CRGB bottom)
+{
+  int ledIndex = 0;
+  for (int row=0; row<16; row++)
+  {
+    uint8_t amountOfBlend = map(row, 0, 16, 0, 255);
+    CRGB rowColor = blend(top, bottom, amountOfBlend);
+    for (int col=0; col<16; col++)
+    {
+      leds[ledIndex] = rowColor;
+      ledIndex++;
+    }
+  }
+}
+
+void fastledshow()
+{
+  if (fadeStartTime + fadeLength > millis())
+  {
+    memmove( leds_buf, leds, NUM_LEDS * sizeof( CRGB) );
+    uint8_t fadeAmount = map(millis(), fadeStartTime, fadeStartTime + fadeLength, 255, 0);
+    for (int i = 0; i < NUM_LEDS; i++)
+    {
+      leds[i].fadeToBlackBy(fadeAmount);
+    }
+  }
+  FastLED.show();
+}
+
+void fadeControl()
+{
+  if (fadeStartTime + fadeLength > millis())
+  {
+    memmove( leds, leds_buf, NUM_LEDS * sizeof( CRGB) );
+    uint8_t fadeAmount = map(millis(), fadeStartTime, fadeStartTime + fadeLength, 255, 0);
+    for (int i = 0; i < NUM_LEDS; i++)
+    {
+      leds[i].fadeToBlackBy(fadeAmount);
+    }
+    FastLED.show();
+  }
 }

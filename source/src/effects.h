@@ -68,6 +68,8 @@ void fxSpiral();
 int XY(int x, int y);
 void Line(int x0, int y0, int x1, int y1, byte color);
 void whatIsTheMatrix();
+void noiseNoise();
+void sinusoid3();
 
 #define kMatrixWidth  16
 #define kMatrixHeight 16
@@ -79,7 +81,7 @@ extern unsigned long baseTime;
 extern CRGB leds[NUM_LEDS];
 extern int realRandom(int max);
 
-uint16_t numEffects = 13; // number of effects
+uint16_t numEffects = 14; // number of effects
 
 // // unused effects
 // Lavalamp2();
@@ -113,6 +115,7 @@ void runEffects()
   else if (currentEffect == 10) fxFire();
   else if (currentEffect == 11) fxSpiral();
   else if (currentEffect == 12) whatIsTheMatrix();
+  else if (currentEffect == 13) noiseNoise();
 }
 
 void nextEffect()
@@ -1707,4 +1710,101 @@ void whatIsTheMatrix()
 
     FastLED.show();
   }
+}
+
+// Noise noise
+
+DEFINE_GRADIENT_PALETTE( pit ) {
+  0,     3,   3,   3,
+  64,   13,   13, 255,  // blue
+  128,   3,   3,   3,
+  192, 255, 130,   3,   // orange
+  255,   3,   3,   3
+};
+
+void noiseNoise() {
+
+  CRGBPalette16 Pal( pit );
+
+  //modulate the position so that it increases/decreases x
+  //(here based on the top left pixel - it could be any position else)
+  x[0] = x[0] + (2 * noise[0][0][0]) - 255;
+  //modulate the position so that it increases/decreases y
+  //(here based on the top right pixel - it could be any position else)
+  y[0] = y[0] + (2 * noise[0][15][0]) - 255;
+  //z just in one direction but with the additional "1" to make sure to never get stuck
+  //(here based on the down left pixel - it could be any position else)
+  z[0] += 1 + ((noise[0][0][15]) / 4);
+  //set the scaling based on left and right pixel of the middle line
+  scale_x[0] = 8000 + (noise[0][0][7] * 16);
+  scale_y[0] = 8000 + (noise[0][15][7] * 16);
+
+  //calculate new noise data
+  uint8_t layer = 0;
+  for (uint8_t i = 0; i < kMatrixWidth; i++) {
+    uint32_t ioffset = scale_x[layer] * (i - CentreX);
+    for (uint8_t j = 0; j < kMatrixHeight; j++) {
+      uint32_t joffset = scale_y[layer] * (j - CentreY);
+      uint16_t data = inoise16(x[layer] + ioffset, y[layer] + joffset, z[layer]);
+      if (data < 11000) data = 11000;
+      if (data > 51000) data = 51000;
+      data = data - 11000;
+      data = data / 161;
+      noise[layer][i][j] = data;
+    }
+  }
+
+  //map the colors
+  for (uint8_t y = 0; y < kMatrixHeight; y++) {
+    for (uint8_t x = 0; x < kMatrixWidth; x++) {
+      //I will add this overlay CRGB later for more colors
+      //it´s basically a rainbow mapping with an inverted brightness mask
+      CRGB overlay = CHSV(noise[0][y][x], 255, noise[0][x][y]);
+      //here the actual colormapping happens - notice the additional colorshift caused by the down right pixel noise[0][15][15]
+      leds[XY(x, y)] = ColorFromPalette( Pal, noise[0][15][15] + noise[0][x][y]) + overlay;
+    }
+  }
+
+  //make it looking nice
+  for (uint16_t i = 0; i < NUM_LEDS; i++)
+  {
+    leds[i].r = dim8_video(leds[i].r);
+    leds[i].g = dim8_video(leds[i].g);
+    leds[i].b = dim8_video(leds[i].b);
+  }
+  //and show it
+  FastLED.show();
+}
+
+// too slow!
+float speed = 0.3; // speed of the movement along the Lissajous curves
+float size = 3;    // amplitude of the curves
+
+void sinusoid3()
+{
+
+  for (uint8_t y = 0; y < kMatrixHeight; y++) {
+      for (uint8_t x = 0; x < kMatrixWidth; x++) {
+
+        float cx = y + float(size * (sinf (float(speed * 0.003 * float(millis() ))) ) ) - 8;  // the 8 centers the middle on a 16x16
+        float cy = x + float(size * (cosf (float(speed * 0.0022 * float(millis()))) ) ) - 8;
+        float v = 127 * (1 + sinf ( sqrtf ( ((cx * cx) + (cy * cy)) ) ));
+        uint8_t data = v;
+        leds[XY(x, y)].r = data;
+
+        cx = x + float(size * (sinf (speed * float(0.0021 * float(millis()))) ) ) - 8;
+        cy = y + float(size * (cosf (speed * float(0.002 * float(millis() ))) ) ) - 8;
+        v = 127 * (1 + sinf ( sqrtf ( ((cx * cx) + (cy * cy)) ) ));
+        data = v;
+        leds[XY(x, y)].b = data;
+
+        cx = x + float(size * (sinf (speed * float(0.0041 * float(millis() ))) ) ) - 8;
+        cy = y + float(size * (cosf (speed * float(0.0052 * float(millis() ))) ) ) - 8;
+        v = 127 * (1 + sinf ( sqrtf ( ((cx * cx) + (cy * cy)) ) ));
+        data = v;
+        leds[XY(x, y)].g = data;
+    }
+  }
+  //and show it
+  FastLED.show();
 }
