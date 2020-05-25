@@ -1,6 +1,6 @@
 /***************************************************
   Game Frame V3 Source Code
-  Jeremy Williams, 2-16-2018
+  Jeremy Williams, 5-21-2020
 
   NOTE: Altering your firmware voids your warranty. Have fun.
 
@@ -10,9 +10,8 @@
 
   In the SD card, place 24 bit color BMP files
 ****************************************************/
-#define firmwareVersion 20180216 // firmware version
+#define firmwareVersion 20200521 // firmware version
 
-#pragma SPARK_NO_PREPROCESSOR
 #include "SdFat.h"
 #include "ds1307.h"
 #include "FastLED.h"
@@ -110,8 +109,7 @@ void WebServerLaunch();
 void readHTML(WebServer &server, const String& htmlfile);
 uint16_t get_mime_type_from_filename(const char* filename);
 void toggleWebServerPriority();
-void webServerCylon();
-void listFiles(uint8_t flags, uint8_t indent);
+void listFiles(WebServer &server, uint8_t flags, uint8_t indent);
 void webServerDisplayManager();
 void scrollAddress();
 void setClockFace(byte face);
@@ -124,6 +122,7 @@ int cloudPlayFolder(String c);
 int cloudAlert(String c);
 int cloudBrightness(String c);
 int cloudColor(String c);
+int cloudScore(String c);
 void setTimeZone();
 void saveTimeZone();
 void systemRecover();
@@ -139,9 +138,6 @@ void runEffects();
 void plasmaPrime();
 void plasmaSlow();
 void nextEffect();
-void randomizePlasma();
-void downloadMode2();
-void downloadIndex();
 int realRandom(int max);
 int realRandom(int min, int max);
 void colorNameToRGB(String colorName, byte *r, byte *g, byte *b);
@@ -152,9 +148,11 @@ void drawChart(float arry[]);
 void getChart(char chartFunction[], char chartSymbol[], char chartInterval[]);
 void refreshChart();
 void refreshChartLatest();
-void fill_gradient(CRGB top, CRGB bottom);
+void fill_with_gradient(CRGB top, CRGB bottom);
 void fastledshow();
 void fadeControl();
+void checkUDP();
+void autoDisplayModeManager();
 
 // Pick an SPI configuration.
 // See SPI configuration section below (comments are for photon).
@@ -185,19 +183,6 @@ const uint8_t SD_CS = D0;
 //------------------------------------------------------------------------------
 
 SdFile myFile; // set filesystem
-
-// FTP for suplimental downloads
-//IPAddress ftpServer( 192, 168, 1, 100 );  // Local network testing
-String ftpServer = "ftp.drivehq.com";
-char ftpFileName[13] = "mode_2.bmp"; // 8.3 format!
-TCPClient ftpClient;
-TCPClient ftpDClient;
-char outBuf[128];
-char outCount;
-byte doFTP(char action[9]);
-byte eRcv();
-void efail();
-File fh;
 
 #define BUFFPIXEL 32 // number of pixels to buffer when reading BMP files
 
@@ -240,8 +225,27 @@ const boolean debugMode = false;
 RTC_DS1307 rtc;
 DateTime now;
 
+// UDP setup
+// Sender ip and port
+IPAddress ipAddress;
+int port = -1;
+int lastUpdate = 0;
+unsigned int localPort = 8888;
+long printTime = 0;
+long lastOK = 0;
+// A UDP instance to let us send and receive packets over UDP
+UDP Udp;
+
 //Global variables
 boolean
+pongclock = false, // pong clock mode
+pong_reset = false,
+pong_celebrate = false,
+pong_scored_hour = false,
+pong_scored_minute = false,
+pong_ball_direction = 0,
+displayModeCycle = false, // automaticly cycle through display modes
+scoreBoard = false,
 chartStock = false, // false = crypto, true = stock
 firmwareUpdateReady = false, // use to speedup firmware updates when using system thread
 wifiFolderFound = false, // found the /wifi folder on SD?
@@ -284,6 +288,13 @@ galleryStateStored = false, // state stored?
 gameInitialized = false;
 
 uint8_t
+pong_speed = 100,
+pong_paddle_left_y = 0,
+pong_paddle_right_y = 0,
+pong_paddle_left_start = 0,
+pong_paddle_right_start = 0,
+pong_paddle_left_target = 0,
+pong_paddle_right_target = 0,
 chartStyle = 1, // 0 = area, 1 = candles
 readPhase = 0, // debug info for reporting reading from SD
 alertPhase = 0, // 0 = inactive, 1 = running, 2 = ending
@@ -315,6 +326,8 @@ int16_t
 folderIndex = 0; // current folder
 
 int
+delayPaddle = 0, // ms delay for movement -- set in game code
+delayBall = 0, // ms delay for ball -- set in game code
 fadeLengthGlobal = 0, // global value
 fadeLength = 0, // length in ms for fade up effect
 currentEffect = 0, // current effect (plasma, etc.)
@@ -345,6 +358,12 @@ timeZone = -7.0f,
 chartValues[18] = {0}; // arrray to store stock/coin values
 
 unsigned long
+pong_celebration_end = 0,
+pong_showtime = 0,
+displayModeCycleTime = 0, // Time to auto change display mode
+displayModeCycleLength = 15000, // Delay length in ms for auto display mode
+moveBall = 0, // time to move the ball
+movePaddle = 0, // time to move the paddle
 fadeStartTime = 0, // millis to end fade
 prevRemoteMillis = 0, // last time a valid remote code was received
 lastRTCCheck = 0, // last DS3231 RTC check timestamp
@@ -367,6 +386,7 @@ menuEndTime = 0, // pause animation while in menu mode
 menuEnterTime = 0; // time we enter menu
 
 char
+scoreString[32], // xx-xx#FFFFFF#FFFFFF for displaying a game score
 currentFile[13], // stores active file when accessing web server
 uploadTargetFolder[32], // temp
 clockFace[25], // clock face
@@ -376,6 +396,7 @@ currentDirectory[32], // store active folder when accessing web server
 chartSymbol[10] = "BTC"; // stock/coin
 
 CRGB secondHandColor = 0; // color grabbed from digits.bmp for second hand
+CRGB secondHands[64]; // second hand colors
 
 // globals for automatic brightness control
 struct abc {
@@ -407,6 +428,7 @@ EEPROM MAP
 4 = clockSet
 5 = clockFace
 6 = timezone
+7 = pongclock
 10 = networkPass
 80 = networkSSID
 120 = networkAuth
@@ -532,10 +554,6 @@ void setup(void) {
     // get time zone
     EEPROM.get(6, timeZone);
     setTimeZone();
-    // scroll the IP address across the screen (if not recovering from power down state)
-    uint8_t powerState;
-    EEPROM.get(201, powerState);
-    if (powerState != 128) scrollAddress();
     // web server setup
     WebServerLaunch();
   }
@@ -560,55 +578,6 @@ void setup(void) {
   if (sd.exists("/00system/mode_3.bmp"))
   {
     displayModeMax = 3;
-  }
-
-  // force download new files
-  boolean forceDownload = true;
-  if (Particle.connected() && forceDownload)
-  {
-    if (!sd.exists("/00system/mode_2.bmp"))
-    {
-      // draw WIFI
-      bmpDraw("/00system/wifi/wifi.bmp", 0, 0);
-      fastledshow();
-
-      Serial.println("Starting FTP...");
-      sd.chdir("/00system");
-      strcpy (ftpFileName, "mode_2.bmp");
-      if(doFTP("download")) Serial.println("FTP OK");
-      else Serial.println("FTP FAIL");
-
-      if (sd.exists("/00system/mode_2.bmp"))
-      {
-        displayModeMax = 2;
-        Serial.print(ftpFileName);
-        Serial.println(" installed.");
-      }
-      sd.chdir("/");
-    }
-
-    // charts
-    if (!sd.exists("/00system/mode_3.bmp"))
-    {
-      // draw WIFI
-      bmpDraw("/00system/wifi/wifi.bmp", 0, 0);
-      fastledshow();
-
-      Serial.println("Starting FTP...");
-      sd.chdir("/00system");
-      strcpy (ftpFileName, "mode_3.bmp");
-      if(doFTP("download")) Serial.println("FTP OK");
-      else Serial.println("FTP FAIL");
-
-      if (sd.exists("/00system/mode_3.bmp"))
-      {
-        displayModeMax = 3;
-        Serial.print(ftpFileName);
-        Serial.println(" installed.");
-        downloadIndex();
-      }
-      sd.chdir("/");
-    }
   }
 
   byte output = 0;
@@ -641,6 +610,11 @@ void setup(void) {
   if (output >= 1 && output <= 5) setClockFace(output);
   else setClockFace(1);
 
+  // read clock face setting from EEPROM
+  output = EEPROM.read(7);
+  if (output >= 0 && output <= 1) pongclock = output;
+  else pongclock = false;
+
   char eeSymbol[10];
   EEPROM.get(148, eeSymbol);
   if (isDigit(eeSymbol[0]) || isAlpha(eeSymbol[0])) // seems legit
@@ -659,6 +633,7 @@ void setup(void) {
   {
     Particle.publish("systemStatus","boot");
   }
+  Udp.begin(localPort);
   digitalWrite(D7, LOW); // turn off Photon LED
 }
 
@@ -682,11 +657,19 @@ void saveTimeZone()
 void initGameFrame()
 {
   Serial.println("Init Game Frame");
+  uint8_t powerState;
+  EEPROM.get(201, powerState);
+  // scroll the IP address across the screen (if not recovering from power down state)
+  if (Particle.connected() && powerState != 128)
+  {
+    scrollAddress();
+  }
+
   closeMyFile();
   // apply automatic brightness if enabled
   if (abc) applyCurrentABC();
   // reset vars
-  currentEffect = 0;
+//  currentEffect = 0;
   secondCounter = 0;
   chartRefresh = 0;
   menuMode = 0;
@@ -751,8 +734,6 @@ void initGameFrame()
   if (!Particle.connected()) syncClock(true);
 
   // check for reboot recovery from off state
-  uint8_t powerState;
-  EEPROM.get(201, powerState);
   if (powerState == 128) framePowered = false;
   else framePowered = true;
   if (!framePowered)
@@ -1283,6 +1264,7 @@ void framePowerDown()
 
 void loop() {
   irReceiver();
+  checkUDP();
   processWebServer();
   powerControl();
   getCurrentTime();
@@ -1334,6 +1316,8 @@ void mainLoop()
     if (menuActive == false)
     {
       Serial.println("Next Button Pressed.");
+      scoreBoard = false; // just in case
+
       // exit chaining if necessary
       if (chainIndex > -1)
       {
@@ -1460,22 +1444,31 @@ void mainLoop()
     }
   }
 
-  // reset clock
+  // increment clock face
   if ((digitalRead(buttonNextPin) == LOW || irCommand == 'N') && buttonPressed == false && buttonEnabled == true && clockShown)
   {
-    if (Particle.connected())
+    Serial.println(pongclock);
+    // toggle pongclock
+    pongclock = !pongclock;
+
+    // turn on pong clock
+    if (pongclock)
     {
-      buttonPressed = true;
-      syncClock(true);
+      pongclock = true;
+      pong_reset = true;
     }
+
+    // increment clock face
     else
     {
-      buttonPressed = true;
-      clockSet = false;
-      clockSetBlink = false;
-      getCurrentTime();
-      setClock();
+      pongclock = false;
+      uint8_t output = EEPROM.read(5);
+      output++;
+      if (output > 5) output = 1;
+      setClockFace(output);
     }
+    initClock();
+    EEPROM.put(7, pongclock);
   }
 
   // menu button
@@ -1594,12 +1587,15 @@ void mainLoop()
         drawChart(chartValues);
         refreshChart();
       }
+      else if (scoreBoard) cloudScore(scoreString);
     }
   }
 
   // currently playing images?
   if (menuActive == false && breakout == false)
   {
+    autoDisplayModeManager();
+
     if (clockShown == false || clockAnimationActive == true)
     {
       fadeControl();
@@ -1626,7 +1622,7 @@ void mainLoop()
         drawFrame();
       }
 
-      // progress to next folder if cycleTime is up
+      // progress if cycleTime is up
       // check for infinite mode
       else if (cycleTimeSetting != 8  && clockShown == false && clockAnimationActive == false)
       {
@@ -1711,6 +1707,55 @@ void mainLoop()
   }
 }
 
+void autoDisplayModeManager()
+{
+  if (displayModeCycle)
+  {
+    long cTime = millis();
+    if (cTime > displayModeCycleTime)
+    {
+      Serial.println("AUTO Display Mode Change!");
+      displayModeCycleTime = cTime + displayModeCycleLength;
+      displayMode++;
+      if (displayMode > displayModeMax) displayMode = 0;
+
+      closeMyFile();
+      if (clockShown || clockAnimationActive)
+      {
+        clockAnimationActive = false;
+        clockShown = false;
+        abortImage = true;
+        nextFolder[0] = '\0';
+      }
+
+      if (displayMode == 1)
+      {
+        initClock();
+        return;
+      }
+
+      else if (playMode == 2)
+      {
+        offsetX = imageWidth / -2 + 8;
+        offsetY = imageHeight / 2 - 8;
+      }
+
+      if (abortImage == false && displayMode == 0)
+      {
+        drawFrame();
+      }
+
+      else clearStripBuffer();
+
+      if (displayMode == 3)
+      {
+        drawChart(chartValues);
+        refreshChart();
+      }
+    }
+  }
+}
+
 void nextImage()
 {
   Serial.println(F("--->"));
@@ -1724,6 +1769,7 @@ void nextImage()
       alertPhase = 0;
       Serial.println("Alert finished. Resuming.");
       resumeGalleryState();
+      if (scoreBoard) cloudScore(scoreString);
       return;
     }
   }
@@ -2489,6 +2535,7 @@ void initClock()
   buttonTime = millis();
   menuMode = 0;
   lastSecond = 255;
+  if (pongclock) pong_reset = true;
 
   closeMyFile();
   holdTime = 0;
@@ -2663,19 +2710,32 @@ void showClock()
     // draw time
     if (enableSecondHand)
     {
-      // offset second hand if required
-      currentSecond = currentSecond + secondOffset;
-      if (currentSecond >= 60) currentSecond -= 60;
-      storeSecondHandColor();
-      drawDigits();
-      secondHand();
-      fastledshow();
+      if (!pongclock)
+      {
+        // offset second hand if required
+        currentSecond = currentSecond + secondOffset;
+        if (currentSecond >= 60) currentSecond -= 60;
+        storeSecondHandColor();
+        drawDigits();
+        secondHand();
+        fastledshow();
+      }
     }
-    // second hand disabled, so only draw time on new minute
-    else if (currentSecond == 0)
+
+    if (currentSecond == 0)
     {
-      drawDigits();
-      fastledshow();
+      // register pong score change
+      if (pongclock)
+      {
+        if (currentMinute == 0) pong_scored_hour = true;
+        else pong_scored_minute = true;
+      }
+      // second hand disabled, so only draw time on new minute
+      else if (!enableSecondHand)
+      {
+        drawDigits();
+        fastledshow();
+      }
     }
 
     // show an animation
@@ -2699,11 +2759,209 @@ void showClock()
     // this boolean is set here to avoid showing an animation immediately after clock being set
     else if (!clockSet) clockSet = true;
   }
+
+  // pong clock
+  if (pongclock)
+  {
+    // game in progress
+    if (!pong_celebrate)
+    {
+      if (millis() > pong_showtime)
+      {
+        pong_showtime = millis() + pong_speed;
+
+        // move ball
+        // left side
+        if ((ballX + sin(degToRad(ballAngle)) * 16) + .5 > 256-16)
+        {
+          if (!pong_scored_minute) 
+          {
+            if (getScreenIndex(ballX, ballY) < getScreenIndex(255, pong_paddle_left_y)) ballAngle = realRandom(225-25, 225+25);
+            else if (getScreenIndex(ballX, ballY) == getScreenIndex(255, pong_paddle_left_y) + 1) swapXdirection();
+            else if (getScreenIndex(ballX, ballY) == getScreenIndex(255, pong_paddle_left_y) - 1) swapXdirection();
+            else ballAngle = realRandom(315-25, 315+25);
+            pong_ball_direction = 1;
+            pong_paddle_right_start = pong_paddle_right_y;
+            pong_paddle_right_target = constrain(pong_predict_y(ballX, ballY, ballAngle), 16, 255-16);
+          }
+          else
+          {
+            pong_celebrate = true;
+            pong_celebration_end = millis() + 2000;
+            // 24 hour conversion
+            if (hour12 && currentHour > 12) currentHour -= 12;
+            if (hour12 && currentHour == 0) currentHour = 12;
+            drawDigits();
+            fastledshow();
+            memcpy( leds_buf, leds, NUM_LEDS * sizeof( CRGB) );
+          }
+        }
+
+        // right side
+        else if ((ballX + sin(degToRad(ballAngle)) * 16) + .5 < 16)
+        {
+          if (!pong_scored_hour)
+          {
+            if (getScreenIndex(ballX, ballY) < getScreenIndex(0, pong_paddle_right_y)) ballAngle = realRandom(135-25, 135+25);
+            else if (getScreenIndex(ballX, ballY) == getScreenIndex(0, pong_paddle_right_y) + 1) swapXdirection();
+            else if (getScreenIndex(ballX, ballY) == getScreenIndex(0, pong_paddle_right_y) - 1) swapXdirection();
+            else ballAngle = realRandom(45-25, 45+25);
+            pong_ball_direction = 0;
+            pong_paddle_left_start = pong_paddle_left_y;
+            pong_paddle_left_target = constrain(pong_predict_y(ballX, ballY, ballAngle), 16, 255-16);
+          }
+          else
+          {
+            pong_celebrate = true;
+            pong_celebration_end = millis() + 2000;            
+            // 24 hour conversion
+            if (hour12 && currentHour > 12) currentHour -= 12;
+            if (hour12 && currentHour == 0) currentHour = 12;
+            drawDigits();
+            fastledshow();
+            memcpy( leds_buf, leds, NUM_LEDS * sizeof( CRGB) );
+          }
+        }
+
+        if ((ballY + cos(degToRad(ballAngle)) * 16) + .5 < 0) swapYdirection();
+        else if ((ballY + cos(degToRad(ballAngle)) * 16) + .5 > 256) swapYdirection();
+
+        ballX = ballX + sin(degToRad(ballAngle)) * 16 + .5;
+        ballY = ballY + cos(degToRad(ballAngle)) * 16 + .5;
+      }
+    }
+
+    // celebrating
+    else if (millis() > pong_celebration_end) pong_reset = true;
+
+    // reset?
+    if (pong_reset)
+    {
+      pong_reset = false;
+      pong_celebrate = false;
+      pong_scored_hour = false;
+      pong_scored_minute = false;
+
+      // store second hands
+      Serial.println("Storing second hand colors...");
+      offsetX = 0;
+      offsetY = 176;
+      bmpDraw(clockFace, 0, 0);
+      uint8_t second_index = 0;
+      for (uint8_t x=0; x<16; x++) secondHands[second_index++] = leds[getIndex(x, 0)];
+      for (uint8_t y=0; y<16; y++) secondHands[second_index++] = leds[getIndex(15, y)];
+      for (uint8_t x=0; x<16; x++) secondHands[second_index++] = leds[getIndex(15-x, 15)];
+      for (uint8_t y=0; y<16; y++) secondHands[second_index++] = leds[getIndex(0, 15-y)];
+
+      // 24 hour conversion
+      if (hour12 && currentHour > 12) currentHour -= 12;
+      if (hour12 && currentHour == 0) currentHour = 12;
+      drawDigits();
+      fastledshow();
+      memcpy( leds_buf, leds, NUM_LEDS * sizeof( CRGB) );
+      pong_paddle_left_y = 128;
+      pong_paddle_left_start = 128;
+      pong_paddle_left_target = 128;
+      pong_paddle_right_y = 128;
+      pong_paddle_right_start = 128;
+      pong_paddle_right_target = 128;
+      ballX = 255-16;
+      ballY = 128;
+      ballAngle = realRandom(225, 315);
+      pong_ball_direction = 1;
+      pong_paddle_right_target = constrain(pong_predict_y(ballX, ballY, ballAngle), 16, 255-16);
+    }
+
+    // manage paddles
+    if (pong_ball_direction == 0) 
+    {
+      int offset = 0;
+      if (pong_scored_minute)
+      {
+        if (pong_paddle_left_target < 3 * 16) offset = 2 * 16;
+        else offset = -2 * 16;
+      }
+      pong_paddle_left_y = map(ballX, 16, 256-16, pong_paddle_left_start, pong_paddle_left_target + offset);
+    }
+    else
+    {
+      int offset = 0;
+      if (pong_scored_hour)
+      {
+        if (pong_paddle_right_target < 3 * 16) offset = 2 * 16;
+        else offset = -2 * 16;
+      }
+      pong_paddle_right_y = map(ballX, 256-16, 16, pong_paddle_right_start, pong_paddle_right_target + offset);
+    }
+
+    // copy the time back on screen
+    memcpy( leds, leds_buf, NUM_LEDS * sizeof( CRGB) );
+
+    // get hue
+    CHSV pongHue_ball = rgb2hsv_approximate(secondHands[currentSecond]);
+    //CHSV pongHue_ball = CHSV(160, 255, 255);
+    CHSV pongHue_paddle = pongHue_ball;
+    pongHue_paddle.hue += 128;
+
+    if (pong_celebrate) pongHue_ball.hue += millis();
+
+    // draw the dots
+    leds[getScreenIndex(255, pong_paddle_left_y)] = pongHue_paddle;
+    leds[getScreenIndex(255, pong_paddle_left_y-16)] = pongHue_paddle;
+    leds[getScreenIndex(255, pong_paddle_left_y+16)] = pongHue_paddle;
+    leds[getScreenIndex(0, pong_paddle_right_y)] = pongHue_paddle;
+    leds[getScreenIndex(0, pong_paddle_right_y-16)] = pongHue_paddle;
+    leds[getScreenIndex(0, pong_paddle_right_y+16)] = pongHue_paddle;
+    ballIndex = getScreenIndex(ballX, ballY);
+    leds[ballIndex] = pongHue_ball;
+    fastledshow();
+  }
+}
+
+int pong_predict_y(int x, int y, int angle)
+{
+  while (x >= 16 && x <= 256-16)
+  {
+    if ((y + cos(degToRad(angle)) * 16) + .5 < 0)
+    {
+      if (angle > 90 && angle < 270)
+      {
+        if (angle > 180) angle = 360 - (angle - 180);
+        else angle = 90 - (angle - 90);
+      }
+      else
+      {
+        if (angle < 90) angle = 90 + (90 - angle);
+        else angle = 180 + (360 - angle);
+      }
+    }
+    else if ((y + cos(degToRad(angle)) * 16) + .5 > 256)
+    {
+      if (angle > 90 && angle < 270)
+      {
+        if (angle > 180) angle = 360 - (angle - 180);
+        else angle = 90 - (angle - 90);
+      }
+      else
+      {
+        if (angle < 90) angle = 90 + (90 - angle);
+        else angle = 180 + (360 - angle);
+      }
+    }
+    x = x + sin(degToRad(angle)) * 16 + .5;
+    y = y + cos(degToRad(angle)) * 16 + .5;            
+  }
+  return y;
 }
 
 int secondsIntoHour()
 {
   return (currentMinute * 60) + currentSecond;
+}
+
+int minutesIntoDay()
+{
+  return (currentHour * 60) + currentMinute;
 }
 
 void drawDigits()
@@ -4192,8 +4450,10 @@ void drawPaddle()
 
 void breakoutLoop()
 {
-  if (holdTime > 0) holdTime--;
-  if (fileIndex > 0) fileIndex--;
+  // if (holdTime > 0) holdTime--; // paddle
+  // if (fileIndex > 0) fileIndex--; // ball
+
+  long currentTime = millis();
 
   if (buttonEnabled == false)
   {
@@ -4201,37 +4461,35 @@ void breakoutLoop()
   }
 
   // menu button
-  if ((digitalRead(buttonNextPin) == LOW || irCommand == 'N' || irNextRepeat == true) && holdTime == 0 && paddleIndex < 237 && gameInitialized == true && buttonEnabled == true)
+  if ((digitalRead(buttonNextPin) == LOW || irCommand == 'N' || irNextRepeat == true) && currentTime > movePaddle && paddleIndex < 237 && gameInitialized == true && buttonEnabled == true)
   {
     paddleIndex++;
     leds[paddleIndex - 1] = CRGB(0, 0, 0);
     drawPaddle();
     // paddle speed
-    holdTime = 100;
+    movePaddle = currentTime + delayPaddle;
     if (ballMoving == false)
     {
+      delayPaddle = 50, // ms delay for movement
+      delayBall = 150, // ms delay for ball
       ballMoving = true;
-      // ball speed
-      if (enableWifi) swapTime = 1000;
-      else swapTime = 2500;
       ballAngle = random8(190, 225);
     }
   }
 
   // next button
-  else if ((digitalRead(buttonMenuPin) == LOW || irCommand == 'M' || irMenuRepeat == true) && holdTime == 0 && paddleIndex > 224 && buttonEnabled == true)
+  else if ((digitalRead(buttonMenuPin) == LOW || irCommand == 'M' || irMenuRepeat == true) && currentTime > movePaddle && paddleIndex > 224 && buttonEnabled == true)
   {
     paddleIndex--;
     leds[paddleIndex + 3] = CRGB(0, 0, 0);
     drawPaddle();
     // paddle speed
-    holdTime = 100;
+    movePaddle = currentTime + delayPaddle;
     if (ballMoving == false)
     {
+      delayPaddle = 50, // ms delay for movement
+      delayBall = 150, // ms delay for ball
       ballMoving = true;
-      // ball speed
-      if (enableWifi) swapTime = 1000;
-      else swapTime = 2500;
       ballAngle = random8(135, 170);
     }
   }
@@ -4239,9 +4497,9 @@ void breakoutLoop()
   else if ((digitalRead(buttonNextPin) == HIGH || digitalRead(buttonMenuPin) == HIGH || irCommand == 'M' || irCommand == 'N') && gameInitialized == false) gameInitialized = true;
 
   // ball logic
-  if (ballMoving == true && fileIndex == 0)
+  if (ballMoving == true && currentTime > moveBall)
   {
-    fileIndex = swapTime;
+    moveBall = currentTime + delayBall;
     leds[ballIndex] = CRGB(0, 0, 0);
 
     // did the player lose?
@@ -4325,8 +4583,7 @@ void breakoutLoop()
       if (leds[ballIndex].r > 0 || leds[ballIndex].g > 0 || leds[ballIndex].b > 0)
       {
         // speed up and change direction
-        if (enableWifi) swapTime -= 5;
-        else swapTime -= 20;
+        delayBall -= 1;
 
         swapYdirection();
         if (winCheck())
@@ -4385,6 +4642,7 @@ boolean winCheck()
     delay(1);
     return true;
   }
+  return 0;
 }
 
 byte getScreenIndex(byte x, byte y)
@@ -4605,18 +4863,6 @@ void setCmd(WebServer &server, WebServer::ConnectionType type, char *url_tail, b
     irCommand = 'N';
   }
 
-  // install FX menu graphic
-  else if (tail == "fx")
-  {
-    downloadMode2();
-  }
-
-  // install FX menu graphic
-  else if (tail == "index")
-  {
-    downloadIndex();
-  }
-
   // brightness
   else if (url_tail[0] == 'b')
   {
@@ -4730,28 +4976,6 @@ void setCmd(WebServer &server, WebServer::ConnectionType type, char *url_tail, b
   }
 }
 
-void webServerCylon()
-{
-  if (webServerActive && framePowered && millis() >= cylonTime)
-  {
-    for (int i = 208; i < 224; i++)
-    {
-      leds[i].fadeToBlackBy(12); // trippy cylon trail
-    }
-    cylonSineValue++;
-    byte cylonLED = 209 + (scale8(sin8(cylonSineValue), 14));
-    if (cylonLED != cylonLastLED)
-    {
-      cylonLastLED = cylonLED;
-      cylonHUE += 1;
-    }
-    // cylonHUE += random(255); // enable for crazy colors
-    leds[cylonLED].setHue(cylonHUE).fadeToBlackBy(128);
-    fastledshow();
-    cylonTime = millis() + 10;
-  }
-}
-
 void commandCmd(WebServer &server, WebServer::ConnectionType type, char *url_tail, bool tail_complete)
 {
   if (type == WebServer::POST)
@@ -4813,12 +5037,6 @@ void commandCmd(WebServer &server, WebServer::ConnectionType type, char *url_tai
           {
             offsetY = imageHeight + 1;
           }
-          server.httpNoContent();
-        }
-        // randomize plasma
-        else if (strcasecmp(name, "plasma_r") == 0)
-        {
-          randomizePlasma();
           server.httpNoContent();
         }
         // play an animation
@@ -5117,6 +5335,7 @@ void helpCmd(WebServer &server, WebServer::ConnectionType type, char *url_tail, 
   server.println("<option value='0'>Gallery</option>");
   server.println("<option value='1'>Clock</option>");
   server.println("<option value='2'>Effects</option>");
+  server.println("<option value='3'>Chart</option>");
   server.println("</select>");
   server.println("</form>");
   server.println("</td>");
@@ -5546,8 +5765,6 @@ void processWebServer()
     /* process incoming connections one at a time forever */
     webserver.processConnection(buff, &len);
 
-    // I'm alive effect
-    /*webServerCylon();*/
   }
 }
 
@@ -5775,7 +5992,11 @@ void scrollAddress()
   {
     // allow the user to skip with NEXT button
     irReceiver();
-    if (irCommand == 'N') break;
+    if (irCommand == 'N')
+    {
+      irCommand = 'Z';
+      break;
+    }
     if (millis() > scrollTick)
     {
       scrollTick = millis() + 75; // ip address scroll speed
@@ -5813,7 +6034,7 @@ void scrollAddress()
 // One function to rule them all
 int cloudCommand(String c)
 {
-  char cmd[33];
+  char cmd[512];
   strcpy(cmd, c);
   char *command;
   char *parameter;
@@ -5847,6 +6068,10 @@ int cloudCommand(String c)
   {
     cloudAlert(parameter);
   }
+  else if (strcasecmp(command, "score") == 0)
+  {
+    cloudScore(parameter);
+  }
   else if (strcasecmp(command, "color") == 0)
   {
     cloudColor(parameter);
@@ -5867,6 +6092,11 @@ int cloudCommand(String c)
       drawDigits();
       fastledshow();
     }
+  }
+  // pong clock
+  else if (strcasecmp(command, "pongclock") == 0)
+  {
+    cloudPongClock(parameter);
   }
   // change time zone
   else if (strcasecmp(command, "timezone") == 0)
@@ -5908,7 +6138,7 @@ int cloudCommand(String c)
   {
     Serial.println("Display mode change requested.");
     uint8_t oldMode = displayMode;
-    uint8_t newMode = displayMode;
+    int16_t newMode = displayMode;
 
     // explicit display mode number provided
     if (isDigit(parameter[0])) newMode = atoi(parameter);
@@ -5931,6 +6161,18 @@ int cloudCommand(String c)
       newMode = 2;
     }
 
+    // support incrementing and decrementing
+    else if (parameter[0] == '+')
+    {
+      newMode = displayMode + 1;
+      if (newMode > displayModeMax) newMode = 0;
+    }
+    else if (parameter[0] == '-')
+    {
+      newMode = displayMode - 1;
+      if (newMode < 0) newMode = displayModeMax;
+    }
+
     if (newMode <= displayModeMax && newMode != oldMode)
     {
       displayMode = newMode;
@@ -5938,6 +6180,11 @@ int cloudCommand(String c)
       if (displayMode == 1)
       {
         initClock();
+      }
+      else if (displayMode == 3)
+      {
+        drawChart(chartValues);
+        refreshChart();
       }
       else
       {
@@ -5981,6 +6228,21 @@ int cloudCommand(String c)
       setCycleTime();
       saveSettingsToEEPROM();
     }
+  }
+  // auto cycle display mode
+  else if (strcasecmp(command, "cycleModes") == 0)
+  {
+    if (isDigit(parameter[0]))
+    {
+      long l = atol(parameter);
+      if (l > 0)
+      {
+        displayModeCycleLength = l;
+        displayModeCycle = true;
+      }
+      else displayModeCycle = false;
+    }
+    else displayModeCycle = false;
   }
   // reboot
   else if (strcasecmp(command, "reboot") == 0)
@@ -6033,6 +6295,23 @@ int cloudCommand(String c)
     refreshChart();
   }
 
+  // generic chart
+  // expects a 17-float array
+  // array should be in reverse chronological order
+  // i.e. first entry will render on the right-most column
+  // example: Command chart 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17
+  else if (strcasecmp(command, "chart") == 0)
+  {
+    chartStock = false;
+    displayMode = 3;
+    chartSymbol[0] = '\0';
+    chartValues[0]=atof(strtok(parameter, ","));
+    for (int i=1; i<17; i++)
+    {
+      chartValues[i]=atof(strtok(NULL, ","));
+    }
+    drawChart(chartValues);
+  }
   return 0;
 }
 
@@ -6112,7 +6391,7 @@ int cloudBrightness(String c)
     if (displayMode == 3) drawChart(chartValues);
     else fastledshow();
   }
-  else return -1;
+  return -1;
 }
 
 int cloudPower(String c)
@@ -6151,6 +6430,43 @@ int cloudPower(String c)
   }
 }
 
+int cloudPongClock(String c)
+{
+  if (c == "on")
+  {
+    Serial.println("PongClock Requested.");
+
+    if (displayMode != 1)
+    {
+      displayMode = 1;
+      initClock();
+    }
+    pong_reset = true;
+    pongclock = true;
+    pong_showtime = 0;
+  }
+  else if (c == "off")
+  {
+    Serial.println("PongClock Off Requested.");
+    pongclock = false;
+  }
+  else
+  {
+    pongclock = !pongclock;
+    if (pongclock)
+    {
+      if (displayMode != 1)
+      {
+        displayMode = 1;
+        initClock();
+      }
+      pong_reset = true;
+      pongclock = true;
+      pong_showtime = 0;
+    }
+  }
+}
+
 int cloudPlayFolder(String c)
 {
   Serial.print("Play requested: ");
@@ -6172,7 +6488,7 @@ int cloudPlayFolder(String c)
       strcpy_P(nextFolder, c);
     }
   }
-  else return 0;
+  return 0;
 }
 
 int cloudAlert(String c)
@@ -6243,6 +6559,7 @@ int cloudAlert(String c)
     else Serial.println("Screen is off. Ignoring request.");
     return alertPhase;
   }
+  return 0;
 }
 
 int cloudColor(String c)
@@ -6335,257 +6652,140 @@ int cloudColor(String c)
       fastledshow();
     }
   }
-  else return 0;
+  return 0;
 }
 
-// ftp
-
-void downloadIndex()
+int cloudScore(String c)
 {
-  if (Particle.connected())
+  Serial.print("Score requested: ");
+  Serial.println(c);
+  if (framePowered && brightness > 0)
   {
-    storeGalleryState();
-    Serial.println("Starting FTP...");
-    sd.chdir("/00system/wifi");
-    strcpy (ftpFileName, "index.html");
-    if(doFTP("download")) Serial.println("FTP OK");
-    else Serial.println("FTP FAIL");
+    // verify chaining folders disabled
+    chainIndex = -1;
+    scoreBoard = true;
+    char scoreBuf[32];
 
-    if (sd.exists("/00system/wifi/index.html"))
+    byte r0 = 0;
+    byte g0 = 0;
+    byte b0 = 0;
+    byte r1 = 0;
+    byte g1 = 0;
+    byte b1 = 0;
+    int c0 = 0;
+    int c1 = 0;
+
+    strcpy(scoreString, c);
+    strcpy(scoreBuf, scoreString);
+    uint8_t s0 = atoi(strtok(scoreBuf, "- "));
+    uint8_t s1 = atoi(strtok(NULL, "-# "));
+    char *color0 = strtok(NULL, "-# ");
+    char *color1 = strtok(NULL, "-# ");
+    Serial.println(color0);
+    Serial.println(color1);
+    if (strlen(color0) > 0)
     {
-      Serial.print(ftpFileName);
-      Serial.println(" installed.");
+      // Get rid of '#' and convert color to integer
+      if (color0[0] == '#') c0 = (int) strtol( &color0[1], NULL, 16);
+      else c0 = (int) strtol( &color0[0], NULL, 16);
+      if (color1[0] == '#') c1 = (int) strtol( &color1[1], NULL, 16);
+      else c1 = (int) strtol( &color1[0], NULL, 16);
+      r0 = c0 >> 16;
+      g0 = c0 >> 8 & 0xFF;
+      b0 = c0 & 0xFF;
+      r1 = c1 >> 16;
+      g1 = c1 >> 8 & 0xFF;
+      b1 = c1 & 0xFF;
     }
-    sd.chdir("/");
-    resumeGalleryState();
-  }
-}
-
-void downloadMode2()
-{
-  if (Particle.connected())
-  {
-    storeGalleryState();
-    Serial.println("Starting FTP...");
-    sd.chdir("/00system");
-    strcpy (ftpFileName, "mode_2.bmp");
-    if(doFTP("download")) Serial.println("FTP OK");
-    else Serial.println("FTP FAIL");
-
-    if (sd.exists("/00system/mode_2.bmp"))
+    else
     {
-      displayModeMax = 2;
-      Serial.print(ftpFileName);
-      Serial.println(" installed.");
+      // default colors
+      b0 = 255;
+      r1 = 255;
     }
-    sd.chdir("/");
-    resumeGalleryState();
-  }
-}
 
-byte doFTP(char action[9])
-{
-  if (action == "upload")
-  {
-    Serial.println("Upload mode");
-    fh = sd.open(ftpFileName,FILE_READ);
-  }
-  else
-  {
-    Serial.println("Download mode");
-    sd.remove(ftpFileName);
-    fh = sd.open(ftpFileName,FILE_WRITE);
-  }
+    clockShown = true; // hack for score flashing screen
 
-  if(!fh)
-  {
-    Serial.println("SD open fail");
-    return 0;
-  }
-
-  if (action == "download")
-  {
-    Serial.println("Rewinding");
-    if(!fh.seek(0))
+    // score 0
+    char numChar[3];
+    itoa(s0, numChar, 10);
+    byte singleDigit = numChar[0] - '0';
+    offsetX = -1;
+    if (s0 >= 10)
     {
-      Serial.println("Rewind fail");
-      fh.close();
-      sd.remove(ftpFileName);
-      return 0;
+      offsetY = singleDigit * 16;
     }
-  }
-
-  Serial.println("SD opened");
-
-  if (ftpClient.connect(ftpServer,21)) {
-    Serial.println("Command connected");
-  }
-  else {
-    fh.close();
-    sd.remove(ftpFileName);
-    Serial.println("Command connection failed");
-    return 0;
-  }
-
-  if(!eRcv()) return 0;
-  ftpClient.println("USER gframe");
-  if(!eRcv()) return 0;
-  ftpClient.println("PASS *s4cmPdv");
-  if(!eRcv()) return 0;
-  ftpClient.println("CWD /drivehqshare/ledseq/gframe");
-  if(!eRcv()) return 0;
-  ftpClient.println("SYST");
-  if(!eRcv()) return 0;
-  ftpClient.println("Type I");
-  if(!eRcv()) return 0;
-  ftpClient.println("PASV");
-  if(!eRcv()) return 0;
-
-  char *tStr = strtok(outBuf,"(,");
-  int array_pasv[6];
-  for ( int i = 0; i < 6; i++) {
-    tStr = strtok(NULL,"(,");
-    array_pasv[i] = atoi(tStr);
-    if(tStr == NULL)
+    else offsetY = 160;
+    bmpDraw(clockFace, 0, 0);
+    // second digit
+    if (s0 >= 10)
     {
-      Serial.println("Bad PASV Answer");
+      singleDigit = numChar[1] - '0';
     }
-  }
+    else singleDigit = numChar[0] - '0';
+    offsetX = 0;
+    offsetY = singleDigit * 16;
+    bmpDraw(clockFace, 3, 0);
 
-  unsigned int hiPort,loPort;
-
-  hiPort = array_pasv[4] << 8;
-  loPort = array_pasv[5] & 255;
-
-  Serial.print("Data port: ");
-  hiPort = hiPort | loPort;
-  Serial.println(hiPort);
-
-  if (ftpDClient.connect(ftpServer,hiPort)) {
-    Serial.println("Data connected");
-  }
-  else {
-    Serial.println("Data connection failed");
-    ftpClient.stop();
-    fh.close();
-    return 0;
-  }
-
-  if (action == "upload")
-  {
-    ftpClient.print("STOR ");
-    ftpClient.println(ftpFileName);
-  }
-  else
-  {
-    ftpClient.print("RETR ");
-    ftpClient.println(ftpFileName);
-  }
-
-  if(!eRcv())
-  {
-    ftpDClient.stop();
-    return 0;
-  }
-
-  if (action == "upload")
-  {
-    Serial.println("Writing");
-
-    byte clientBuf[64];
-    int clientCount = 0;
-
-    while(fh.available())
+    // score 1
+    numChar[0] = '\0';
+    numChar[1] = '\0';
+    numChar[2] = '\0';
+    itoa(s1, numChar, 10);
+    singleDigit = numChar[0] - '0';
+    if (s1 >= 10)
     {
-      clientBuf[clientCount] = fh.read();
-      clientCount++;
+      offsetY = singleDigit * 16;
+    }
+    else offsetY = 160;
+    bmpDraw(clockFace, 8, 0);
+    // second digit
+    if (s1 >= 10)
+    {
+      singleDigit = numChar[1] - '0';
+    }
+    else singleDigit = numChar[0] - '0';
+    offsetY = singleDigit * 16;
+    bmpDraw(clockFace, 12, 0);
 
-      if(clientCount > 63)
+    closeMyFile();
+    clockShown = false; // turn off hack
+
+    // colorize
+    // left
+    for (int x=0; x<7; x++)
+    {
+      for (int y=0; y<16; y++)
       {
-        ftpDClient.write(clientBuf,64);
-        clientCount = 0;
-        delay(2);
+        if (leds[getIndex(x, y)] != CRGB(0,0,0)) leds[getIndex(x, y)] = CRGB(r0, g0, b0);
       }
     }
-
-    if(clientCount > 0) ftpDClient.write(clientBuf,clientCount);
-  }
-
-  else
-  {
-    while(ftpDClient.connected())
+    // right
+    for (int x=7; x<16; x++)
     {
-      while(ftpDClient.available())
+      for (int y=0; y<16; y++)
       {
-        char c = ftpDClient.read();
-        fh.write(c);
-        //Serial.write(c);
+        if (leds[getIndex(x, y)] != CRGB(0,0,0)) leds[getIndex(x, y)] = CRGB(r1, g1, b1);
       }
     }
-  }
+    FastLED.show();
 
-  ftpDClient.stop();
-  Serial.println("Data disconnected");
-
-  if(!eRcv()) return 0;
-  ftpClient.println("QUIT");
-  if(!eRcv()) return 0;
-  ftpClient.stop();
-  Serial.println("Command disconnected");
-
-  fh.close();
-  Serial.println("SD closed");
-  return 1;
-}
-
-byte eRcv()
-{
-  byte respCode;
-  byte thisByte;
-
-  while(!ftpClient.available()) Particle.process();
-  respCode = ftpClient.peek();
-  outCount = 0;
-
-  while(ftpClient.available())
-  {
-    thisByte = ftpClient.read();
-    Serial.write(thisByte);
-
-    if(outCount < 127)
+    if (displayMode == 0)
     {
-      outBuf[outCount] = thisByte;
-      outCount++;
-      outBuf[outCount] = 0;
+      baseTime = millis();
     }
+    else if (displayMode == 1)
+    {
+      currentSecond = Time.second();
+      clockAnimationActive = true;
+  //    clockShown = false;
+  //    closeMyFile();
+  //    abortImage = true;
+    }
+    holdTime = -1;
+    secondCounter = 0;
   }
-
-  if(respCode >= '4')
-  {
-    efail();
-    return 0;
-  }
-
-  return 1;
-}
-
-void efail()
-{
-  byte thisByte = 0;
-
-  ftpClient.println("QUIT");
-
-  while(!ftpClient.available()) Particle.process();
-  while(ftpClient.available())
-  {
-    thisByte = ftpClient.read();
-    Serial.write(thisByte);
-  }
-
-  ftpClient.stop();
-  Serial.println("Command disconnected");
-  fh.close();
-  Serial.println("SD closed");
+  return 0;
 }
 
 void showCoindeskBTC()
@@ -6778,6 +6978,21 @@ void getChart(char chartFunction[], char chartSymbol[], char chartInterval[])
   drawChart(chartValues);
 }
 
+void fill_with_gradient(CRGB top, CRGB bottom)
+{
+  int ledIndex = 0;
+  for (int row=0; row<16; row++)
+  {
+    uint8_t amountOfBlend = map(row, 0, 16, 0, 255);
+    CRGB rowColor = blend(top, bottom, amountOfBlend);
+    for (int col=0; col<16; col++)
+    {
+      leds[ledIndex] = rowColor;
+      ledIndex++;
+    }
+  }
+}
+
 void drawChart(float arry[])
 {
   // expects a 17-float array
@@ -6797,6 +7012,13 @@ void drawChart(float arry[])
   }
 
   clearStripBuffer();
+  int arraySize = 0;
+  arraySize = sizeof(chartValues)/sizeof(chartValues[0]);
+  Serial.println(arraySize);
+  for (int i=0; i<arraySize; i++)
+  {
+    Serial.println(chartValues[i]);
+  }
 
   // area render
   if (chartStyle == 0)
@@ -6820,31 +7042,34 @@ void drawChart(float arry[])
   // candle stick render (no wicks!)
   else if (chartStyle == 1)
   {
-    if (APANativeBrightness) fill_gradient(CRGB(0,0,8), CRGB(0,0,64));
-    else fill_gradient(CRGB(0,0,32), CRGB(0,0,64));
+    if (APANativeBrightness) fill_with_gradient(CRGB(0,0,8), CRGB(0,0,64));
+    else fill_with_gradient(CRGB(0,0,32), CRGB(0,0,64));
     // 17th entry is used to color first candlestick
     for (int i=0; i<16; i++)
     {
       // map $USD to 0-15 (screen height)
       uint8_t y = map(arry[i], arrayMin, arrayMax, 0.0f, 15.0f);
       uint8_t pY = map(arry[i+1], arrayMin, arrayMax, 0.0f, 15.0f); // previous column
-      // avoid draw errors for first column
-      if (arry[16] > arrayMax) arry[16] = arrayMax;
-      else if (arry[16] < arrayMin) arry[16] = arrayMin;
+
       // bull
       if (arry[i] >= arry[i+1])
       {
-         for (int candle = pY; candle <= y; candle++)
-         {
-           leds[getIndex(15-i, 15-candle)] = CRGB(0, 255, 0);
-         }
+        for (int candle = pY; candle <= y; candle++)
+        {
+          leds[getIndex(15-i, 15-candle)] = CRGB(0, 255, 0);
+          // white dot
+          if (candle==y && i==0) leds[getIndex(15, 15-y)] = CRGB(128, 255, 128);
+        }
       }
       // bear
       else
       {
         for (int candle = pY; candle >= y; candle--)
         {
-          leds[getIndex(15-i, 15-candle)] = CRGB(255, 0, 0);
+          // avoid draw errors for first column
+          if (15-candle >= 0) leds[getIndex(15-i, 15-candle)] = CRGB(255, 0, 0);
+          // white dot
+          if (candle==y && i==0) leds[getIndex(15, 15-y)] = CRGB(255, 128, 128);
         }
       }
     }
@@ -6854,88 +7079,79 @@ void drawChart(float arry[])
 
 void refreshChart()
 {
-  char chartFunction[26];
-  // daily or intraday chart?
-  if (cycleTimeSetting == 8)
+  if (chartSymbol[0] != '\0')
   {
-    if (chartStock) strcpy(chartFunction, "TIME_SERIES_DAILY");
-    else strcpy(chartFunction, "DIGITAL_CURRENCY_DAILY");
-  }
-  else
-  {
-    if (chartStock) strcpy(chartFunction, "TIME_SERIES_INTRADAY");
-    else strcpy(chartFunction, "DIGITAL_CURRENCY_INTRADAY"); // DIGITAL_CURRENCY_INTRADAY
-  }
+    char chartFunction[26];
+    // daily or intraday chart?
+    if (cycleTimeSetting == 8)
+    {
+      if (chartStock) strcpy(chartFunction, "TIME_SERIES_DAILY");
+      else strcpy(chartFunction, "DIGITAL_CURRENCY_DAILY");
+    }
+    else
+    {
+      if (chartStock) strcpy(chartFunction, "TIME_SERIES_INTRADAY");
+      else strcpy(chartFunction, "DIGITAL_CURRENCY_INTRADAY"); // DIGITAL_CURRENCY_INTRADAY
+    }
 
-  char timeInterval[3];
-  if (cycleTimeSetting <= 3) strcpy(timeInterval, "1");
-  else if (cycleTimeSetting == 4) strcpy(timeInterval, "5");
-  else if (cycleTimeSetting == 5) strcpy(timeInterval, "15");
-  else if (cycleTimeSetting == 6) strcpy(timeInterval, "30");
-  else strcpy(timeInterval, "60");
-  getChart(chartFunction, chartSymbol, timeInterval);
+    char timeInterval[3];
+    if (cycleTimeSetting <= 3) strcpy(timeInterval, "1");
+    else if (cycleTimeSetting == 4) strcpy(timeInterval, "5");
+    else if (cycleTimeSetting == 5) strcpy(timeInterval, "15");
+    else if (cycleTimeSetting == 6) strcpy(timeInterval, "30");
+    else strcpy(timeInterval, "60");
+    getChart(chartFunction, chartSymbol, timeInterval);
+  }
 }
 
 void refreshChartLatest()
 {
-  // Request path and body can be set at runtime or at setup.
-  char requestPath[120];
-  String jsonString;
-  Serial.print("Latest ");
-  Serial.print(chartSymbol);
-  Serial.print(" Price: ");
-
-  // stock
-  if (chartStock)
+  if (chartSymbol[0] != '\0')
   {
-    strcpy(requestPath, "/gf-stocks.php?chartFunction=TIME_SERIES_INTRADAY&chartInterval=1&chartSymbol=");
-    strcat(requestPath, chartSymbol);
-    request.path = requestPath;
+    // Request path and body can be set at runtime or at setup.
+    char requestPath[120];
+    String jsonString;
+    Serial.print("Latest ");
+    Serial.print(chartSymbol);
+    Serial.print(" Price: ");
 
-    // Get request
-    http.get(request, response, headers);
-
-    char jsonIntraday[2048];
-    jsonString = String(response.body);
-    strcpy(jsonIntraday, jsonString);
-
-    chartValues[0]=atof(strtok(jsonIntraday, ","));
-  }
-
-  // crypto
-  else
-  {
-    strcpy(requestPath, "/gf-stocks.php?chartFunction=DIGITAL_CURRENCY_PRICE&chartSymbol=");
-    strcat(requestPath, chartSymbol);
-    request.path = requestPath;
-
-    // Get request
-    http.get(request, response, headers);
-
-    char jsonIntraday[2048];
-    jsonString = String(response.body);
-    strcpy(jsonIntraday, jsonString);
-
-    chartValues[0]=atof(jsonIntraday);
-  }
-
-  Serial.print(chartValues[0]);
-  Serial.print(" ");
-  Serial.println(Time.timeStr());
-}
-
-void fill_gradient(CRGB top, CRGB bottom)
-{
-  int ledIndex = 0;
-  for (int row=0; row<16; row++)
-  {
-    uint8_t amountOfBlend = map(row, 0, 16, 0, 255);
-    CRGB rowColor = blend(top, bottom, amountOfBlend);
-    for (int col=0; col<16; col++)
+    // stock
+    if (chartStock)
     {
-      leds[ledIndex] = rowColor;
-      ledIndex++;
+      strcpy(requestPath, "/gf-stocks.php?chartFunction=TIME_SERIES_INTRADAY&chartInterval=1&chartSymbol=");
+      strcat(requestPath, chartSymbol);
+      request.path = requestPath;
+
+      // Get request
+      http.get(request, response, headers);
+
+      char jsonIntraday[2048];
+      jsonString = String(response.body);
+      strcpy(jsonIntraday, jsonString);
+
+      chartValues[0]=atof(strtok(jsonIntraday, ","));
     }
+
+    // crypto
+    else
+    {
+      strcpy(requestPath, "/gf-stocks.php?chartFunction=DIGITAL_CURRENCY_PRICE&chartSymbol=");
+      strcat(requestPath, chartSymbol);
+      request.path = requestPath;
+
+      // Get request
+      http.get(request, response, headers);
+
+      char jsonIntraday[2048];
+      jsonString = String(response.body);
+      strcpy(jsonIntraday, jsonString);
+
+      chartValues[0]=atof(jsonIntraday);
+    }
+
+    Serial.print(chartValues[0]);
+    Serial.print(" ");
+    Serial.println(Time.timeStr());
   }
 }
 
@@ -6964,5 +7180,41 @@ void fadeControl()
       leds[i].fadeToBlackBy(fadeAmount);
     }
     FastLED.show();
+  }
+}
+
+// UDP
+void checkUDP()
+{
+  if (Udp.parsePacket() > 0) {
+
+    char sBuffer[64];
+    int sBufferIndex = 0;
+    sBuffer[0] = '\0';
+
+    // store in buffer
+    while (sBufferIndex < 63 && Udp.available())
+    {
+      sBuffer[sBufferIndex] = Udp.read();
+      sBufferIndex++;
+    }
+    sBuffer[sBufferIndex] = '\0';
+    Serial.print("UDP: ");
+    Serial.println(sBuffer);
+
+    cloudCommand(sBuffer);
+
+    // Store sender ip and port
+    ipAddress = Udp.remoteIP();
+    port = Udp.remotePort();
+
+    if (port > -1)
+    {
+      // Echo back data to sender
+      Udp.beginPacket(ipAddress, port);
+      Udp.write("ok: ");
+      Udp.write(sBuffer);
+      Udp.endPacket();
+    }
   }
 }

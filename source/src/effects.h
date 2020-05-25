@@ -9,7 +9,6 @@ void runEffects();
 void nextEffect();
 void plasmaPrime();
 void plasmaSlow();
-void randomizePlasma();
 void fxSwirl();
 void FillNoise(byte layer);
 void MirroredNoise();
@@ -70,6 +69,7 @@ void Line(int x0, int y0, int x1, int y1, byte color);
 void whatIsTheMatrix();
 void noiseNoise();
 void sinusoid3();
+void Fire2018();
 
 #define kMatrixWidth  16
 #define kMatrixHeight 16
@@ -112,7 +112,7 @@ void runEffects()
   else if (currentEffect == 7) Water();
   else if (currentEffect == 8) Caleido3();
   else if (currentEffect == 9) CrossNoise2();
-  else if (currentEffect == 10) fxFire();
+  else if (currentEffect == 10) Fire2018();
   else if (currentEffect == 11) fxSpiral();
   else if (currentEffect == 12) whatIsTheMatrix();
   else if (currentEffect == 13) noiseNoise();
@@ -212,23 +212,6 @@ float radius1  = 65.2/4, radius2  = 92.0/4, radius3  = 163.2/4, radius4  = 176.8
             centery1 = 34.8/4, centery2 = 26.0/4, centery3 =  56.0/4, centery4 = -11.6/4;
 float       angle1   =  0.0, angle2   =  0.0, angle3   =   0.0, angle4   =   0.0;
 long        hueShift =  0;
-
-void randomizePlasma()
-{
-  Serial.println("Randomizing.");
-  radius1  = random(0, 1000)/10;
-  radius2  = random(0, 1000)/10;
-  radius3  = random(0, 2000)/10;
-  radius4  = random(0, 2000)/10;
-  centerx1 = random(0, 1000)/10;
-  centerx2 = random(0, 1000)/10;
-  centerx3 =  random(0, 1000)/10;
-  centerx4 =  random(0, 1000)/10;
-  centery1 = random(0, 1000)/10;
-  centery2 = random(0, 1000)/10;
-  centery3 =  random(0, 1000)/10;
-  centery4 = -random(0, 1000)/10;
-}
 
 void plasmaSlow() {
   frameCount++;
@@ -1651,6 +1634,18 @@ int XY(int x, int y) {
   }
 }
 
+// this finds the right index within a serpentine matrix
+uint16_t XY2( uint8_t x, uint8_t y) {
+  uint16_t i;
+  if ( y & 0x01) {
+    uint8_t reverseX = (kMatrixWidth - 1) - x;
+    i = (y * kMatrixWidth) + reverseX;
+  } else {
+    i = (y * kMatrixWidth) + x;
+  }
+  return i;
+}
+
 //  Bresenham line algorythm
 void Line(int x0, int y0, int x1, int y1, byte color)
 {
@@ -1807,4 +1802,114 @@ void sinusoid3()
   }
   //and show it
   FastLED.show();
+}
+
+// the color palette
+CRGBPalette16 Pal = HeatColors_p;
+uint32_t f2018_x;
+uint32_t f2018_y;
+uint32_t f2018_z;
+uint32_t f2018_scale_x;
+uint32_t f2018_scale_y;
+uint8_t f2018_noise[16][16];
+
+void Fire2018() {
+
+  // get one noise value out of a moving noise space
+  uint16_t ctrl1 = inoise16(11 * millis(), 0, 0);
+  // get another one
+  uint16_t ctrl2 = inoise16(13 * millis(), 100000, 100000);
+  // average of both to get a more unpredictable curve
+  uint16_t  ctrl = ((ctrl1 + ctrl2) / 2);
+
+  // this factor defines the general speed of the heatmap movement
+  // high value = high speed
+  uint8_t speed = 27;
+
+  // here we define the impact of the wind
+  // high factor = a lot of movement to the sides
+  f2018_x = 3 * ctrl * speed;
+
+  // this is the speed of the upstream itself
+  // high factor = fast movement
+  f2018_y = 15 * millis() * speed;
+
+  // just for ever changing patterns we move through z as well
+  f2018_z = 3 * millis() * speed ;
+
+  // ...and dynamically scale the complete heatmap for some changes in the
+  // size of the heatspots.
+  // The speed of change is influenced by the factors in the calculation of ctrl1 & 2 above.
+  // The divisor sets the impact of the size-scaling.
+  f2018_scale_x = ctrl1 / 2;
+  f2018_scale_y = ctrl2 / 2;
+
+  // Calculate the noise array based on the control parameters.
+  uint8_t layer = 0;
+  for (uint8_t i = 0; i < kMatrixWidth; i++) {
+    uint32_t ioffset = f2018_scale_x * (i - CentreX);
+    for (uint8_t j = 0; j < kMatrixHeight; j++) {
+      uint32_t joffset = f2018_scale_y * (j - CentreY);
+      uint16_t data = ((inoise16(f2018_x + ioffset, f2018_y + joffset, f2018_z)) + 1);
+      f2018_noise[i][j] = data >> 8;
+    }
+  }
+
+
+  // Draw the first (lowest) line - seed the fire.
+  // It could be random pixels or anything else as well.
+  for (uint8_t x = 0; x < kMatrixWidth; x++) {
+    // draw
+    leds[XY2(x, kMatrixHeight-1)] = ColorFromPalette( Pal, f2018_noise[x][0]);
+    // and fill the lowest line of the heatmap, too
+    heat[XY2(x, kMatrixHeight-1)] = f2018_noise[x][0];
+  }
+
+  // Copy the heatmap one line up for the scrolling.
+  for (uint8_t y = 0; y < kMatrixHeight - 1; y++) {
+    for (uint8_t x = 0; x < kMatrixWidth; x++) {
+      heat[XY2(x, y)] = heat[XY2(x, y + 1)];
+    }
+  }
+
+  // Scale the heatmap values down based on the independent scrolling noise array.
+  for (uint8_t y = 0; y < kMatrixHeight - 1; y++) {
+    for (uint8_t x = 0; x < kMatrixWidth; x++) {
+
+      // get data from the calculated noise field
+      uint8_t dim = f2018_noise[x][y];
+
+      // This number is critical
+      // If it´s to low (like 1.1) the fire dosn´t go up far enough.
+      // If it´s to high (like 3) the fire goes up too high.
+      // It depends on the framerate which number is best.
+      // If the number is not right you loose the uplifting fire clouds
+      // which seperate themself while rising up.
+      dim = dim / 1.4;
+
+      dim = 255 - dim;
+
+      // here happens the scaling of the heatmap
+      heat[XY2(x, y)] = scale8(heat[XY2(x, y)] , dim);
+    }
+  }
+
+  // Now just map the colors based on the heatmap.
+  for (uint8_t y = 0; y < kMatrixHeight - 1; y++) {
+    for (uint8_t x = 0; x < kMatrixWidth; x++) {
+      leds[XY2(x, y)] = ColorFromPalette( Pal, heat[XY2(x, y)]);
+    }
+  }
+
+  // Done. Bring it on!
+  FastLED.show();
+
+  // I hate this delay but with 8 bit scaling there is no way arround.
+  // If the framerate gets too high the frame by frame scaling doesn´s work anymore.
+  // Basically it does but it´s impossible to see then...
+
+  // If you change the framerate here you need to adjust the
+  // y speed and the dim divisor, too.
+  delay(10);
+
 }
