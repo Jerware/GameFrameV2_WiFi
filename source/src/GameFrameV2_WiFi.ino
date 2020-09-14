@@ -503,7 +503,7 @@ void setup(void) {
   // run burn in test if both tactile buttons held on cold boot
   if ((digitalRead(buttonNextPin) == LOW) && (digitalRead(buttonMenuPin) == LOW))
   {
-    brightness = 7;
+    setBrightness(7);
     stripSetBrightness();
     while (true)
     {
@@ -515,7 +515,7 @@ void setup(void) {
   if (digitalRead(buttonMenuPin) == LOW)
   {
     clearEEPROM();
-    brightness = 1;
+    setBrightness(1);
     stripSetBrightness();
     playMode = 0;
     cycleTimeSetting = 2;
@@ -585,7 +585,7 @@ void setup(void) {
   // load last settings
   // read brightness setting from EEPROM
   output = EEPROM.read(0);
-  if (output >= 1 && output <= 7) brightness = output;
+  if (output >= 1 && output <= 7) setBrightness(output);
   stripSetBrightness();
 
   // read playMode setting from EEPROM
@@ -734,8 +734,7 @@ void initGameFrame()
   if (!Particle.connected()) syncClock(true);
 
   // check for reboot recovery from off state
-  if (powerState == 128) framePowered = false;
-  else framePowered = true;
+  setFramePowered(powerState != 128);
   if (!framePowered)
   {
     framePowerDown();
@@ -748,6 +747,16 @@ void initGameFrame()
     readIniFile();
     drawFrame();
   }
+}
+
+void setFramePowered(bool powered) {
+  framePowered = powered;
+  sendUdp(NULL);
+}
+
+void setBrightness(int bright) {
+  brightness = bright;
+  sendUdp(NULL);
 }
 
 void applyCurrentABC()
@@ -773,7 +782,7 @@ void applyCurrentABC()
   if (newBrightness > -1)
   {
     if (newBrightness == 0) newBrightness = 1;
-    brightness = newBrightness;
+    setBrightness(newBrightness);
     stripSetBrightness();
     saveSettingsToEEPROM();
   }
@@ -781,8 +790,8 @@ void applyCurrentABC()
 
 void stripSetBrightness()
 {
-  if (brightness > 7) brightness = 7;
-  else if (brightness < 0) brightness = 0;
+  if (brightness > 7) setBrightness(7);
+  else if (brightness < 0) setBrightness(0);
 
   // APA102 native brightness
   if (APANativeBrightness)
@@ -1207,7 +1216,7 @@ void powerControl()
     // abc brightness set to zero; turn display on
     if (brightness == 0)
     {
-      brightness = 1;
+      setBrightness(1);
       stripSetBrightness();
       if (displayMode == 0) drawFrame(); // refrech the screen
       else initClock();
@@ -1215,7 +1224,7 @@ void powerControl()
     // toggle system power
     else
     {
-      framePowered = !framePowered;
+      setFramePowered(!framePowered);
       // power down
       if (!framePowered)
       {
@@ -1234,7 +1243,7 @@ void powerControl()
   {
     if (millis() > menuPowerCounter && digitalRead(buttonMenuPin) == LOW && menuActive)
     {
-      framePowered = false;
+      setFramePowered(false);
       framePowerDown();
     }
   }
@@ -1243,7 +1252,7 @@ void powerControl()
   // power on
   else if (digitalRead(buttonMenuPin) == LOW && buttonPressed == false)
   {
-    framePowered = true;
+    setFramePowered(true);
   }
 }
 
@@ -1356,7 +1365,7 @@ void mainLoop()
       if (menuMode == 0)
       {
         brightness += 1;
-        if (brightness > 7) brightness = 1;
+        if (brightness > 7) setBrightness(1);
         char brightChar[2];
         char brightFile[23];
         strcpy_P(brightFile, PSTR("/00system/bright_"));
@@ -2481,7 +2490,7 @@ void runABC()
       {
         if (dayInMinutes == triggerTimes[x])
         {
-          brightness = brightnessSettings[x];
+          setBrightness(brightnessSettings[x]);
           stripSetBrightness();
           if (brightness == 0)
           {
@@ -4867,7 +4876,7 @@ void setCmd(WebServer &server, WebServer::ConnectionType type, char *url_tail, b
   else if (url_tail[0] == 'b')
   {
     if (brightness == 0 && (atoi(&url_tail[1]) > 0 && webServerActive)) bmpDraw("/00system/wifi/wifi.bmp", 0, 0);
-    brightness = atoi(&url_tail[1]);
+    setBrightness(atoi(&url_tail[1]));
     stripSetBrightness();
     saveSettingsToEEPROM();
     if (displayMode == 3) drawChart(chartValues);
@@ -6360,8 +6369,8 @@ int cloudBrightness(String c)
       if (APANativeBrightness)
       {
         newBright = 7.0f * multiplier;
-        brightness = round(newBright);
-        if (brightness < 1) brightness = 1;
+        setBrightness(round(newBright));
+        if (brightness < 1) setBrightness(1);
         ledController.setAPA102Brightness(brightness);
       }
     }
@@ -6384,7 +6393,7 @@ int cloudBrightness(String c)
     }*/
     else
     {
-      brightness = atoi(c);
+      setBrightness(atoi(c));
       stripSetBrightness();
       saveSettingsToEEPROM();
     }
@@ -6401,7 +6410,7 @@ int cloudPower(String c)
     Serial.println("Power On Requested.");
     if (brightness == 0)
     {
-      brightness = 1;
+      setBrightness(1);
       stripSetBrightness();
       if (displayMode == 0) drawFrame(); // refrech the screen
       else initClock();
@@ -6410,7 +6419,7 @@ int cloudPower(String c)
     {
       EEPROM.update(201, 255); // store power state
       initGameFrame();
-      framePowered = true;
+      setFramePowered(true);
     }
   }
   else if (c == "off")
@@ -6419,7 +6428,7 @@ int cloudPower(String c)
     if (framePowered)
     {
       framePowerDown();
-      framePowered = false;
+      setFramePowered(false);
     }
   }
   else
@@ -7208,13 +7217,33 @@ void checkUDP()
     ipAddress = Udp.remoteIP();
     port = Udp.remotePort();
 
-    if (port > -1)
+    sendUdp(sBuffer);
+  }
+}
+
+void sendUdp(char sBuffer[]) {
+  if (port > -1)
     {
-      // Echo back data to sender
+      // Report state to last UDP sender
       Udp.beginPacket(ipAddress, port);
-      Udp.write("ok: ");
-      Udp.write(sBuffer);
+      Udp.write("{");
+      if (sBuffer != NULL) {
+        Udp.write("\"originatingCommand\": \"");
+        Udp.write(sBuffer);
+        Udp.write("\",");
+      }
+
+      Udp.write("\"power\": \"");
+      Udp.write(framePowered ? "on" : "off");
+      Udp.write("\",");
+
+      Udp.write("\"brightness\": ");
+      char str[1];
+      sprintf(str, "%d", brightness);
+      Udp.write(str);
+
+      Udp.write("}");
+
       Udp.endPacket();
     }
-  }
 }
